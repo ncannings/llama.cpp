@@ -196,6 +196,109 @@ static int cpu_count_math_cpus(int n_cpu) {
 
 #endif // __x86_64__ && __linux__
 
+
+// Heterogeneous CPU (Arm big.LITTLE / DynamIQ): decode is barrier-synchronised, so threads on little cores slow every step.
+// Generation threads go on the high-capacity cores; the batch (prompt) pool keeps all cores.
+int32_t common_cpu_get_big_cores(bool (&mask)[GGML_MAX_N_THREADS], int32_t & n_online) {
+    n_online = 0;
+    std::memset(mask, 0, sizeof(mask));
+#if defined(__linux__)
+    std::vector<int64_t> cap;
+    const char * root_env = std::getenv("LLAMA_CPU_SYSFS_ROOT"); // test hook
+    const std::string root = root_env ? std::string(root_env) : std::string("/sys/devices/system/cpu");
+    for (uint32_t cpu = 0; cpu < GGML_MAX_N_THREADS; ++cpu) {
+        std::ifstream online(root + "/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+        if (!online.is_open()) {
+            break; // no more cpus
+        }
+        int64_t c = -1;
+        std::ifstream f(root + "/cpu" + std::to_string(cpu) + "/cpu_capacity");
+        if (f.is_open()) {
+            f >> c;
+        }
+        cap.push_back(c);
+    }
+    n_online = (int32_t) cap.size();
+    if (cap.empty()) {
+        return 0;
+    }
+    int64_t cmax = -1, cmin = INT64_MAX;
+    for (int64_t c : cap) {
+        if (c < 0) {
+            return 0; // capacity not exposed on some cpu: treat as unknown
+        }
+        cmax = std::max(cmax, c);
+        cmin = std::min(cmin, c);
+    }
+    if (cmax <= cmin) {
+        return 0; // homogeneous
+    }
+    // capacities differ a little inside one cluster, so split at the largest gap and require a real step
+    std::vector<int64_t> sorted = cap;
+    std::sort(sorted.begin(), sorted.end());
+    int64_t best_gap = 0, split = cmax; // split: smallest capacity counted as "big"
+    for (size_t i = 1; i < sorted.size(); ++i) {
+        const int64_t gap = sorted[i] - sorted[i - 1];
+        if (gap > best_gap) {
+            best_gap = gap;
+            split = sorted[i];
+        }
+    }
+    if (best_gap * 10 < cmax) {
+        return 0; // no cluster step, treat as homogeneous
+    }
+    int32_t n_big = 0;
+    for (size_t i = 0; i < cap.size(); ++i) {
+        if (cap[i] >= split) {
+            mask[i] = true;
+            n_big++;
+        }
+    }
+    return n_big;
+#elif defined(__APPLE__) && defined(__MACH__)
+    // Apple silicon: perflevel0 = performance cores, perflevel1 = efficiency cores; no affinity API, so `mask` stays empty
+    int32_t n_perf = 0, n_eff = 0, n_all = 0;
+    size_t len = sizeof(int32_t);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &n_perf, &len, NULL, 0) != 0) { return 0; }
+    len = sizeof(int32_t);
+    if (sysctlbyname("hw.perflevel1.logicalcpu", &n_eff,  &len, NULL, 0) != 0) { n_eff = 0; }
+    len = sizeof(int32_t);
+    if (sysctlbyname("hw.ncpu", &n_all, &len, NULL, 0) != 0) { n_all = n_perf + n_eff; }
+    n_online = n_all;
+    if (n_perf <= 0 || n_eff <= 0) {
+        return 0; // homogeneous or unknown
+    }
+    return n_perf;
+#else
+    return 0;
+#endif
+}
+
+std::string common_cpu_mask_to_hex(const bool (&mask)[GGML_MAX_N_THREADS]) {
+    // hex string as accepted by parse_cpu_mask (bit i = cpu i)
+    std::string bits;
+    int hi = -1;
+    for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
+        if (mask[i]) {
+            hi = i;
+        }
+    }
+    if (hi < 0) {
+        return "0x0";
+    }
+    std::string out;
+    for (int nib = hi / 4; nib >= 0; --nib) {
+        int v = 0;
+        for (int b = 0; b < 4; ++b) {
+            if (mask[nib * 4 + b]) {
+                v |= 1 << b;
+            }
+        }
+        out += "0123456789abcdef"[v];
+    }
+    return "0x" + out;
+}
+
 /**
  * Returns number of CPUs on system that are useful for math.
  */
@@ -285,15 +388,101 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 //
 
 
+// drop cores that another process keeps busy: one foreign spinning thread inside a barrier pool stalls every step
+static int32_t common_cpu_drop_busy_cores(bool (&mask)[GGML_MAX_N_THREADS], int32_t n_cpus, int sample_ms, int busy_percent) {
+#if defined(__linux__)
+    auto read_stat = [&](std::vector<int64_t> & busy, std::vector<int64_t> & total) {
+        busy.assign(n_cpus, 0); total.assign(n_cpus, 0);
+        std::ifstream f("/proc/stat");
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.compare(0, 3, "cpu") != 0 || line.size() < 4 || !isdigit((unsigned char) line[3])) {
+                continue;
+            }
+            int cpu = 0; int64_t v[10] = {0};
+            if (sscanf(line.c_str(), "cpu%d %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld", &cpu,
+                       &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) < 5) {
+                continue;
+            }
+            if (cpu < 0 || cpu >= n_cpus) {
+                continue;
+            }
+            int64_t t = 0; for (int i = 0; i < 10; i++) { t += v[i]; }
+            const int64_t idle = v[3] + v[4]; // idle + iowait
+            busy[cpu] = t - idle; total[cpu] = t;
+        }
+    };
+    std::vector<int64_t> b0, t0, b1, t1;
+    read_stat(b0, t0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(sample_ms));
+    read_stat(b1, t1);
+    int32_t dropped = 0;
+    for (int i = 0; i < n_cpus && i < GGML_MAX_N_THREADS; i++) {
+        if (!mask[i]) {
+            continue;
+        }
+        const int64_t dt = t1[i] - t0[i];
+        const int64_t db = b1[i] - b0[i];
+        if (dt > 0 && db * 100 >= busy_percent * dt) {
+            mask[i] = false;
+            dropped++;
+        }
+    }
+    return dropped;
+#else
+    GGML_UNUSED(mask); GGML_UNUSED(n_cpus); GGML_UNUSED(sample_ms); GGML_UNUSED(busy_percent);
+    return 0;
+#endif
+}
+
+int32_t common_cpu_drop_busy_cores_public(bool (&mask)[GGML_MAX_N_THREADS], int32_t n_cpus) {
+    return common_cpu_drop_busy_cores(mask, n_cpus, 50, 50);
+}
+
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model) {
     int32_t n_set = 0;
 
+    bool    big[GGML_MAX_N_THREADS];
+    int32_t n_online = 0;
+    const int32_t n_big = cpuparams.topology_auto ? common_cpu_get_big_cores(big, n_online) : 0;
+
+    const bool defaulted = cpuparams.n_threads < 0;
     if (cpuparams.n_threads < 0) {
         // Assuming everything about cpuparams is invalid
         if (role_model != nullptr) {
             cpuparams = *role_model;
+            if (n_big > 0 && !role_model->mask_valid_user && n_online > n_big) {
+                // batch pool: use every core, no mask
+                cpuparams.n_threads  = n_online;
+                cpuparams.mask_valid = false;
+                std::memset(cpuparams.cpumask, 0, sizeof(cpuparams.cpumask));
+            }
         } else {
             cpuparams.n_threads = common_cpu_get_num_math();
+        }
+    }
+
+    if (n_big > 0 && role_model == nullptr && !cpuparams.mask_valid && (defaulted || cpuparams.n_threads <= n_big)) {
+        bool mask_usable = false;
+        for (int i = 0; i < GGML_MAX_N_THREADS; i++) { mask_usable = mask_usable || big[i]; }
+        if (mask_usable) {
+            const int32_t dropped = common_cpu_drop_busy_cores(big, n_online, 50, 50);
+            const int32_t n_free  = n_big - dropped;
+            if (n_free >= 1) {
+                std::memcpy(cpuparams.cpumask, big, sizeof(cpuparams.cpumask));
+                cpuparams.mask_valid = true;
+                cpuparams.strict_cpu = false;
+                if (defaulted || cpuparams.n_threads > n_free) {
+                    cpuparams.n_threads = n_free;
+                }
+                COM_INF("heterogeneous CPU: %d of %d cores are high-capacity (%d busy, dropped); generation threads = %d on mask %s (disable with --no-cpu-topology)\n",
+                        n_big, n_online, dropped, cpuparams.n_threads, common_cpu_mask_to_hex(cpuparams.cpumask).c_str());
+            }
+        } else if (defaulted) {
+            // no affinity API on this OS: size the pools only
+            cpuparams.n_threads = n_big;
+            COM_INF("heterogeneous CPU: %d of %d cores are performance cores; generation threads = %d, batch threads = %d (disable with --no-cpu-topology)\n",
+                    n_big, n_online, n_big, n_online);
         }
     }
 

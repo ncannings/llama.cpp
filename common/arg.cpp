@@ -1535,6 +1535,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: \"\")",
         [](common_params & params, const std::string & mask) {
             params.cpuparams.mask_valid = true;
+            params.cpuparams.mask_valid_user = true;
             if (!parse_cpu_mask(mask, params.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -1545,11 +1546,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "range of CPUs for affinity. Complements --cpu-mask",
         [](common_params & params, const std::string & range) {
             params.cpuparams.mask_valid = true;
+            params.cpuparams.mask_valid_user = true;
             if (!parse_cpu_range(range, params.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid range");
             }
         }
     ));
+    add_opt(common_arg(
+        {"--no-cpu-topology"},
+        "disable automatic placement of generation threads on the high-capacity cores of heterogeneous CPUs (Arm big.LITTLE)",
+        [](common_params & params) {
+            params.cpuparams.topology_auto       = false;
+            params.cpuparams_batch.topology_auto = false;
+        }
+    ).set_env("LLAMA_ARG_NO_CPU_TOPOLOGY"));
     add_opt(common_arg(
         {"--cpu-strict"}, "<0|1>",
         string_format("use strict CPU placement (default: %u)\n", (unsigned) params.cpuparams.strict_cpu),
@@ -1579,6 +1589,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "CPU affinity mask: arbitrarily long hex. Complements cpu-range-batch (default: same as --cpu-mask)",
         [](common_params & params, const std::string & mask) {
             params.cpuparams_batch.mask_valid = true;
+            params.cpuparams_batch.mask_valid_user = true;
             if (!parse_cpu_mask(mask, params.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -1589,6 +1600,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "ranges of CPUs for affinity. Complements --cpu-mask-batch",
         [](common_params & params, const std::string & range) {
             params.cpuparams_batch.mask_valid = true;
+            params.cpuparams_batch.mask_valid_user = true;
             if (!parse_cpu_range(range, params.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid range");
             }

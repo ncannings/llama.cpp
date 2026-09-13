@@ -69,13 +69,20 @@ struct common_cpu_params {
     int      n_threads                   = -1;
     bool     cpumask[GGML_MAX_N_THREADS] = {false}; // CPU affinity mask.
     bool     mask_valid                  = false;   // Default: any CPU
+    bool     mask_valid_user             = false;   // mask came from -C/-Cr
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
     bool     strict_cpu                  = false;   // Use strict CPU placement
     uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
+    bool     topology_auto               = true;    // heterogeneous CPU: generation threads on the high-capacity cores by default
 };
 
 int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
+// heterogeneous CPU: fill `mask` with the high-capacity cores and return their count (0 = homogeneous or unknown)
+int32_t common_cpu_get_big_cores(bool (&mask)[GGML_MAX_N_THREADS], int32_t & n_online);
+std::string common_cpu_mask_to_hex(const bool (&mask)[GGML_MAX_N_THREADS]);
+// drop cores that another process keeps busy from `mask`; returns how many
+int32_t common_cpu_drop_busy_cores_public(bool (&mask)[GGML_MAX_N_THREADS], int32_t n_cpus);
 
 //
 // Common params

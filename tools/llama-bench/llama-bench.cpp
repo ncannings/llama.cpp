@@ -332,6 +332,12 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+// heterogeneous CPU defaults
+static bool        g_topo_auto     = false;
+static int32_t     g_topo_n_big    = 0;
+static int32_t     g_topo_n_online = 0;
+static std::string g_topo_big_mask = "0x0";
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -1174,6 +1180,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.cpu_mask.empty()) {
         params.cpu_mask = cmd_params_defaults.cpu_mask;
+        bool    big[GGML_MAX_N_THREADS];
+        int32_t n_online = 0;
+        const int32_t n_big = common_cpu_get_big_cores(big, n_online);
+        if (n_big > 0 && params.n_threads == cmd_params_defaults.n_threads && !getenv("LLAMA_ARG_NO_CPU_TOPOLOGY")) {
+            // heterogeneous CPU with default threads and mask: generation tests on the big cores, prompt tests on every core
+            const int32_t dropped = common_cpu_drop_busy_cores_public(big, n_online);
+            g_topo_auto     = true;
+            g_topo_n_big    = n_big - dropped;
+            g_topo_n_online = n_online;
+            g_topo_big_mask = common_cpu_mask_to_hex(big);
+        }
     }
     if (params.cpu_strict.empty()) {
         params.cpu_strict = cmd_params_defaults.cpu_strict;
@@ -1445,6 +1462,17 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     }
     // clang-format on
 
+    if (g_topo_auto) {
+        for (auto & inst : instances) {
+            if (inst.n_gen == 0) {
+                inst.n_threads = g_topo_n_online;
+                inst.cpu_mask  = "0x0";
+            } else {
+                inst.n_threads = g_topo_n_big;
+                inst.cpu_mask  = g_topo_big_mask;
+            }
+        }
+    }
     return instances;
 }
 
