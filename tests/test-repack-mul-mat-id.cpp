@@ -1,0 +1,217 @@
+// Checks ggml_mul_mat_id over a repacked (CPU_REPACK) 3D weight against the un-repacked
+// reference path. The repack path groups the rows routed to one expert into 4-row gemm
+// calls and zero pads the tail group, so the interesting variable is the number of rows
+// one expert receives: 1, 2, 3, 4, 5, 8, 12 and 17 are all exercised, plus a mixed
+// routing that gives different experts different counts. The results must be identical
+// bit for bit, not merely within tolerance.
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+static ggml_backend_buffer_type_t find_repack_buft(void) {
+    ggml_backend_reg_t reg = ggml_backend_cpu_reg();
+    auto * get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    ggml_backend_buffer_type_t * bufts = get_extra_bufts(dev);
+    while (bufts && *bufts) {
+        if (strcmp(ggml_backend_buft_name(*bufts), "CPU_REPACK") == 0) {
+            return *bufts;
+        }
+        bufts++;
+    }
+    return nullptr;
+}
+
+static bool tq2_0_is_repacked(ggml_backend_buffer_type_t buft) {
+    ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_TQ2_0, 256, 8, 2);
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
+    const bool repacked = buf_w != nullptr && w->extra != nullptr;
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx_w);
+    return repacked;
+}
+
+// dst[n][iu][t] = sum_k W[ids[iu][t]][n][k] * X[t][iu][k]
+static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t buft,
+                           const std::vector<uint8_t> & w_q, int64_t K, int64_t N, int64_t n_as,
+                           const std::vector<float> & x, int64_t n_used, int64_t n_tok,
+                           const std::vector<int32_t> & ids_v, std::vector<float> & out,
+                           bool require_repack) {
+    ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_TQ2_0, K, N, n_as);
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
+    if (buf_w == nullptr) {
+        fprintf(stderr, "failed to allocate weight on %s\n", ggml_backend_buft_name(buft));
+        return false;
+    }
+    if (require_repack && w->extra == nullptr) {
+        // no TQ2_0 repack variant is registered for this CPU (needs NEON dotprod or i8mm)
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx_w);
+        return false;
+    }
+    ggml_backend_tensor_set(w, w_q.data(), 0, w_q.size());
+
+    ggml_init_params cp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(cp);
+    ggml_tensor * xt  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_used, n_tok);
+    ggml_tensor * idt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+    ggml_tensor * y   = ggml_mul_mat_id(ctx, w, xt, idt);
+    ggml_cgraph * gf  = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_tensor_set(xt,  x.data(),     0, x.size() * sizeof(float));
+    ggml_backend_tensor_set(idt, ids_v.data(), 0, ids_v.size() * sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "graph compute failed\n");
+        return false;
+    }
+
+    out.resize(ggml_nelements(y));
+    ggml_backend_tensor_get(y, out.data(), 0, out.size() * sizeof(float));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx_w);
+    return true;
+}
+
+int main(void) {
+    ggml_backend_load_all();
+
+    ggml_backend_buffer_type_t buft_ref    = ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_type_t buft_repack = find_repack_buft();
+    if (buft_repack == nullptr) {
+        fprintf(stderr, "CPU_REPACK buffer type not available in this build, nothing to test\n");
+        return 0;
+    }
+
+    if (!tq2_0_is_repacked(buft_repack)) {
+        printf("test-repack-mul-mat-id: SKIP (no TQ2_0 repack variant registered for this CPU, needs NEON dotprod or i8mm)\n");
+        return 0;
+    }
+
+    const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
+    const int64_t tokens[]    = { 1, 2, 3, 4, 5, 8, 12, 17 };
+    const int     threads[]   = { 1, 4 };
+    const int64_t n_as        = 4;
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    bool ok = true;
+
+    for (const int nth : threads) {
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(backend, nth);
+
+        for (const auto & shape : shapes) {
+            const int64_t K = shape[0];
+            const int64_t N = shape[1];
+
+            std::vector<float> w_f(K * N * n_as);
+            for (auto & v : w_f) {
+                v = dist(rng);
+            }
+            std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N * n_as);
+            ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N * n_as, K, nullptr);
+
+            // case 1: every token routed to the same expert, so that expert receives
+            //         exactly n_tok rows and the other three receive none
+            for (const int64_t n_tok : tokens) {
+                const int64_t n_used = 1;
+                std::vector<float> x(K * n_used * n_tok);
+                for (auto & v : x) {
+                    v = dist(rng);
+                }
+                std::vector<int32_t> ids(n_used * n_tok, 1); // expert 1 takes everything
+
+                std::vector<float> out_ref;
+                std::vector<float> out_rep;
+                if (!run_mul_mat_id(backend, buft_ref, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
+                    return 1;
+                }
+                if (!run_mul_mat_id(backend, buft_repack, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
+                    return 1;
+                }
+
+                float max_abs = 0.0f;
+                float max_diff = 0.0f;
+                for (size_t i = 0; i < out_ref.size(); i++) {
+                    max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
+                    max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
+                }
+                const bool pass = std::isfinite(max_diff) && max_diff == 0.0f;
+                printf("t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                       nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL");
+                ok = ok && pass;
+            }
+
+            // case 2: mixed routing, two experts per token, so the four experts receive
+            //         different row counts and the dst rows are genuinely scattered
+            {
+                const int64_t n_used = 2;
+                const int64_t n_tok  = 17;
+                std::vector<float> x(K * n_used * n_tok);
+                for (auto & v : x) {
+                    v = dist(rng);
+                }
+                std::vector<int32_t> ids(n_used * n_tok);
+                int counts[4] = { 0, 0, 0, 0 };
+                for (int64_t t = 0; t < n_tok; t++) {
+                    for (int64_t u = 0; u < n_used; u++) {
+                        const int32_t e = (int32_t) ((3 * t + u) % n_as);
+                        ids[t * n_used + u] = e;
+                        counts[e]++;
+                    }
+                }
+
+                std::vector<float> out_ref;
+                std::vector<float> out_rep;
+                if (!run_mul_mat_id(backend, buft_ref, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
+                    return 1;
+                }
+                if (!run_mul_mat_id(backend, buft_repack, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
+                    return 1;
+                }
+
+                float max_abs = 0.0f;
+                float max_diff = 0.0f;
+                for (size_t i = 0; i < out_ref.size(); i++) {
+                    max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
+                    max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
+                }
+                const bool pass = std::isfinite(max_diff) && max_diff == 0.0f;
+                printf("t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                       nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
+                       max_abs, max_diff, pass ? "OK" : "FAIL");
+                ok = ok && pass;
+            }
+        }
+
+        ggml_backend_free(backend);
+    }
+
+    printf("%s\n", ok ? "test-repack-mul-mat-id: PASS" : "test-repack-mul-mat-id: FAIL");
+    return ok ? 0 : 1;
+}
