@@ -4385,7 +4385,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -4395,15 +4395,31 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
-
+                    const int64_t ne01 = op->src[0]->ne[1]; // src0 rows, i.e. dst columns
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
+                    const int64_t ne10 = op->src[1]->ne[0]; // n_embd
                     const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
 
-                    const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
+                    const int64_t n_ids  = op->src[2]->ne[0]; // n_expert_used
+                    const int64_t n_toks = op->src[2]->ne[1]; // n_tokens
 
-                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+
+                    // [n_as] row counts followed by [n_as][ne12] row mappings
+                    const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
+                    size = sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+
+                    // 4-row interleaved activation panels, one per group of 4 rows routed to one
+                    // expert, the tail group of each expert zero padded to 4 rows. The panel row
+                    // count is sum_a 4*ceil(c_a/4) <= (sum_a c_a) + 3*n_as.
+                    size  = GGML_PAD(size, 64);
+                    size += nbw1*(size_t) (n_ids*n_toks + 3*ne02);
+
+                    // per thread: 4 gathered f32 source rows, and a 4 x ne01 f32 output tile
+                    size  = GGML_PAD(size, 64);
+                    size += (size_t) n_threads*4*ne10*sizeof(float);
+                    size  = GGML_PAD(size, 64);
+                    size += (size_t) n_threads*4*ne01*sizeof(float);
 
                     return true;
                 }
@@ -4611,6 +4627,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
+    // MUL_MAT_ID over a repacked src0. The rows routed to one expert are processed in groups
+    // of four with the same 4-row gemm that forward_mul_mat uses; the tail group of an expert
+    // is zero padded to four rows. Both the activation quantisation and the gemm are per
+    // activation row, so the padding rows cannot change the result of the real rows, which is
+    // what tests/test-repack-mul-mat-id.cpp checks bit for bit.
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -4621,8 +4642,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int ith = params->ith;
         const int nth = params->nth;
-
-        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
         // we don't support permuted src0 or src1
         GGML_ASSERT(nb00 == ggml_type_size(src0->type));
@@ -4644,35 +4663,38 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
+        // one activation row in the repacked parameter type
         const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
 
         struct mmid_row_mapping {
             int32_t i1;
             int32_t i2;
         };
 
-        GGML_ASSERT(params->wsize >=
-                (GGML_PAD(nbw3, sizeof(int64_t)) +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
-                );
-
-        auto * wdata          = (char *)params->wdata;
-        auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
+        auto * wdata = (char *) params->wdata;
 
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
-        auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
+        auto * matrix_row_counts = (int64_t *) wdata;                                               // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
-        // src1: float32 => param type
-        for (int64_t i12 = 0; i12 < ne12; ++i12) {
-            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                           ne10);
-            }
-        }
+        size_t woff = sizeof(int64_t)*(size_t) n_as*(ne12 + 1);
+
+        // 4-row interleaved activation panels, one per group of 4 rows routed to one expert
+        woff = GGML_PAD(woff, 64);
+        char * const  panels     = wdata + woff;
+        const size_t  panels_cap = nbw1*(size_t) ((int64_t) n_ids*ids->ne[1] + 3*n_as);
+        woff += panels_cap;
+
+        // per thread scratch: the 4 gathered f32 source rows, and the 4 x ne01 f32 output tile
+        woff = GGML_PAD(woff, 64);
+        float * const src_rows = (float *) (wdata + woff) + (size_t) ith*4*ne10;
+        woff += (size_t) nth*4*ne10*sizeof(float);
+
+        woff = GGML_PAD(woff, 64);
+        float * const dst_tile = (float *) (wdata + woff) + (size_t) ith*4*ne01;
+        woff += (size_t) nth*4*ne01*sizeof(float);
+
+        GGML_ASSERT(params->wsize >= woff);
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
 
@@ -4696,7 +4718,67 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+        // Quantise the activations straight into the 4-row interleaved layout the gemm wants.
+        // Every group is built exactly once and then read by every thread, so this costs one
+        // quantisation per panel row rather than one per thread.
+        {
+            int64_t panel_row = 0;
+            int64_t group     = 0;
+
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+
+                for (int64_t ir1 = 0; ir1 < cne1; ir1 += 4, ++group, panel_row += 4) {
+                    if (group % nth != ith) {
+                        continue;
+                    }
+
+                    GGML_ASSERT((size_t) (panel_row + 4)*nbw1 <= panels_cap);
+
+                    const int64_t nrows = MIN((int64_t) 4, cne1 - ir1);
+
+                    for (int64_t ir = 0; ir < nrows; ++ir) {
+                        const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + ir);
+
+                        const int64_t i11 = row_mapping.i1 % ne11;
+                        const int64_t i12 = row_mapping.i2;
+
+                        memcpy(src_rows + ir*ne10,
+                               (const char *) src1->data + i11*nb11 + i12*nb12,
+                               ne10*sizeof(float));
+                    }
+
+                    if (nrows < 4) {
+                        memset(src_rows + nrows*ne10, 0, (4 - nrows)*ne10*sizeof(float));
+                    }
+
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(src_rows, panels + panel_row*nbw1, 4, ne10);
+                }
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // the src0 column range is the same for every expert, so split it once
+        int64_t src0_cur_start = (ith * ne01) / nth;
+        int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+
+        // Align boundaries to NB_COLS - round up to ensure all data is included
+        src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
+        src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
+        if (src0_cur_end > ne01) {
+            src0_cur_end = ne01;
+        }
+
+        if (src0_cur_start >= src0_cur_end) {
+            return;
+        }
+
+        const int64_t ncols = src0_cur_end - src0_cur_start;
+
         // compute each matrix multiplication in sequence
+        int64_t panel_row = 0;
+
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -4706,39 +4788,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
 
-            //const int64_t nr0 = ne01; // src0 rows
-            const int64_t nr1 = cne1; // src1 rows
+            for (int64_t ir1 = 0; ir1 < cne1; ir1 += 4, panel_row += 4) {
+                // dst rows of one expert are scattered, so the gemm writes a contiguous tile first
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panels + panel_row*nbw1,
+                    4, ncols);
 
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+                const int64_t nrows = MIN((int64_t) 4, cne1 - ir1);
 
-            // Align boundaries to NB_COLS - round up to ensure all data is included
-            src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
-            src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
-            if (src0_cur_end > ne01) {
-                src0_cur_end = ne01;
-            }
+                for (int64_t ir = 0; ir < nrows; ++ir) {
+                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + ir);
 
-            if (src0_cur_start >= src0_cur_end) {
-                return;
-            }
+                    const int64_t i1 = row_mapping.i1;  // selected expert index
+                    const int64_t i2 = row_mapping.i2;  // row index in src1
 
-            for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
-
-                const int id = row_mapping.i1;  // selected expert index
-
-                const int64_t i11 = id % ne11;
-                const int64_t i12 = row_mapping.i2;  // row index in src1
-
-                const int64_t i1 = id;               // selected expert index
-                const int64_t i2 = i12;              // row
-
-                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
-
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
-                    src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+                    memcpy((float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start,
+                           dst_tile + ir*ncols,
+                           ncols*sizeof(float));
+                }
             }
         }
 #undef MMID_MATRIX_ROW
