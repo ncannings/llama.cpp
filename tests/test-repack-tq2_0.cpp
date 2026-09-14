@@ -1,5 +1,6 @@
 // Checks the repacked TQ2_0 GEMV/GEMM path (CPU_REPACK buffer type) against the
-// un-repacked ggml_vec_dot_tq2_0_q8_K path for batch sizes 1, 4 and 17.
+// un-repacked ggml_vec_dot_tq2_0_q8_K path for batch sizes 1, 4, 5, 8, 12, 16 and 17:
+// the gemm plane count and the gemv remainder of forward_mul_mat are both exercised.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -105,7 +106,7 @@ int main(void) {
     ggml_backend_cpu_set_n_threads(backend, 4);
 
     const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2560, 128 } };
-    const int64_t batches[]   = { 1, 4, 17 };
+    const int64_t batches[]   = { 1, 4, 5, 8, 12, 16, 17 };
     const float   tol_rel     = 1e-3f;
 
     std::mt19937 rng(1234);

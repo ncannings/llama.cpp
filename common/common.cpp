@@ -450,13 +450,13 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
     if (cpuparams.n_threads < 0) {
         // Assuming everything about cpuparams is invalid
         if (role_model != nullptr) {
+            // The batch pool is NOT the prompt pool: llama_context::graph_compute selects it for
+            // every ubatch with n_tokens > 1, which includes multi-sequence decode at 4 to 16
+            // tokens per step. Widening it onto the little cores therefore slows parallel decode
+            // (barrier-synchronised, and on a pinned run it oversubscribes), for a few per cent of
+            // prompt throughput. So the batch pool inherits the generation pool unchanged, as
+            // upstream does. Pass -tb / --cpu-mask-batch to use every core for batch work.
             cpuparams = *role_model;
-            if (n_big > 0 && !role_model->mask_valid_user && n_online > n_big) {
-                // batch pool: use every core, no mask
-                cpuparams.n_threads  = n_online;
-                cpuparams.mask_valid = false;
-                std::memset(cpuparams.cpumask, 0, sizeof(cpuparams.cpumask));
-            }
         } else {
             cpuparams.n_threads = common_cpu_get_num_math();
         }
@@ -481,8 +481,8 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
         } else if (defaulted) {
             // no affinity API on this OS: size the pools only
             cpuparams.n_threads = n_big;
-            COM_INF("heterogeneous CPU: %d of %d cores are performance cores; generation threads = %d, batch threads = %d (disable with --no-cpu-topology)\n",
-                    n_big, n_online, n_big, n_online);
+            COM_INF("heterogeneous CPU: %d of %d cores are performance cores; threads = %d (disable with --no-cpu-topology)\n",
+                    n_big, n_online, n_big);
         }
     }
 
