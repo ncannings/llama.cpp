@@ -1,5 +1,8 @@
 // Checks ggml_mul_mat_id over a repacked (CPU_REPACK) 3D weight against the un-repacked
-// reference path. The repack path groups the rows routed to one expert into 4-row gemm
+// reference path. TQ2_0 (q8_K activations) takes the new 4-row gemm batching and must be
+// identical bit for bit. Q4_0 (q8_0 activations) is carried as a non-regression control: its
+// repack kernels are not bit-exact against the reference even for a single row on the
+// untouched gemv path, so it is checked against the usual 1e-3 relative tolerance instead. The repack path groups the rows routed to one expert into 4-row gemm
 // calls and zero pads the tail group, so the interesting variable is the number of rows
 // one expert receives: 1, 2, 3, 4, 5, 8, 12 and 17 are all exercised, plus a mixed
 // routing that gives different experts different counts. The results must be identical
@@ -36,10 +39,10 @@ static ggml_backend_buffer_type_t find_repack_buft(void) {
     return nullptr;
 }
 
-static bool tq2_0_is_repacked(ggml_backend_buffer_type_t buft) {
+static bool type_is_repacked(ggml_backend_buffer_type_t buft, ggml_type wtype) {
     ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
-    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_TQ2_0, 256, 8, 2);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, wtype, 256, 8, 2);
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
     const bool repacked = buf_w != nullptr && w->extra != nullptr;
     ggml_backend_buffer_free(buf_w);
@@ -48,21 +51,21 @@ static bool tq2_0_is_repacked(ggml_backend_buffer_type_t buft) {
 }
 
 // dst[n][iu][t] = sum_k W[ids[iu][t]][n][k] * X[t][iu][k]
-static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t buft,
+static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t buft, ggml_type wtype,
                            const std::vector<uint8_t> & w_q, int64_t K, int64_t N, int64_t n_as,
                            const std::vector<float> & x, int64_t n_used, int64_t n_tok,
                            const std::vector<int32_t> & ids_v, std::vector<float> & out,
                            bool require_repack) {
     ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
-    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, GGML_TYPE_TQ2_0, K, N, n_as);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx_w, wtype, K, N, n_as);
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
     if (buf_w == nullptr) {
         fprintf(stderr, "failed to allocate weight on %s\n", ggml_backend_buft_name(buft));
         return false;
     }
     if (require_repack && w->extra == nullptr) {
-        // no TQ2_0 repack variant is registered for this CPU (needs NEON dotprod or i8mm)
+        // no repack variant of this type is registered for this CPU
         ggml_backend_buffer_free(buf_w);
         ggml_free(ctx_w);
         return false;
@@ -106,11 +109,12 @@ int main(void) {
         return 0;
     }
 
-    if (!tq2_0_is_repacked(buft_repack)) {
+    if (!type_is_repacked(buft_repack, GGML_TYPE_TQ2_0)) {
         printf("test-repack-mul-mat-id: SKIP (no TQ2_0 repack variant registered for this CPU, needs NEON dotprod or i8mm)\n");
         return 0;
     }
 
+    const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
     const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
     const int64_t tokens[]    = { 1, 2, 3, 4, 5, 8, 12, 17 };
     const int     threads[]   = { 1, 4 };
@@ -121,7 +125,12 @@ int main(void) {
 
     bool ok = true;
 
-    for (const int nth : threads) {
+    for (const ggml_type wtype : wtypes) {
+      if (!type_is_repacked(buft_repack, wtype)) {
+        printf("skipping %s, no repack variant registered for this CPU\n", ggml_type_name(wtype));
+        continue;
+      }
+      for (const int nth : threads) {
         ggml_backend_t backend = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(backend, nth);
 
@@ -133,8 +142,8 @@ int main(void) {
             for (auto & v : w_f) {
                 v = dist(rng);
             }
-            std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N * n_as);
-            ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N * n_as, K, nullptr);
+            std::vector<uint8_t> w_q(ggml_row_size(wtype, K) * N * n_as);
+            ggml_quantize_chunk(wtype, w_f.data(), w_q.data(), 0, N * n_as, K, nullptr);
 
             // case 1: every token routed to the same expert, so that expert receives
             //         exactly n_tok rows and the other three receive none
@@ -148,10 +157,10 @@ int main(void) {
 
                 std::vector<float> out_ref;
                 std::vector<float> out_rep;
-                if (!run_mul_mat_id(backend, buft_ref, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
+                if (!run_mul_mat_id(backend, buft_ref, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
                     return 1;
                 }
-                if (!run_mul_mat_id(backend, buft_repack, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
+                if (!run_mul_mat_id(backend, buft_repack, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
                     return 1;
                 }
 
@@ -161,9 +170,10 @@ int main(void) {
                     max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
                     max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
                 }
-                const bool pass = std::isfinite(max_diff) && max_diff == 0.0f;
-                printf("t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s\n",
-                       nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL");
+                const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
+                const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                printf("%-6s t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                       ggml_type_name(wtype), nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL");
                 ok = ok && pass;
             }
 
@@ -188,10 +198,10 @@ int main(void) {
 
                 std::vector<float> out_ref;
                 std::vector<float> out_rep;
-                if (!run_mul_mat_id(backend, buft_ref, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
+                if (!run_mul_mat_id(backend, buft_ref, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
                     return 1;
                 }
-                if (!run_mul_mat_id(backend, buft_repack, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
+                if (!run_mul_mat_id(backend, buft_repack, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
                     return 1;
                 }
 
@@ -201,15 +211,17 @@ int main(void) {
                     max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
                     max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
                 }
-                const bool pass = std::isfinite(max_diff) && max_diff == 0.0f;
-                printf("t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
-                       nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
+                const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
+                const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                       ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
                        max_abs, max_diff, pass ? "OK" : "FAIL");
                 ok = ok && pass;
             }
         }
 
         ggml_backend_free(backend);
+      }
     }
 
     printf("%s\n", ok ? "test-repack-mul-mat-id: PASS" : "test-repack-mul-mat-id: FAIL");
