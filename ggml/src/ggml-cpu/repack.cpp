@@ -4820,15 +4820,91 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
-        // the src0 column range does not depend on the expert, so split it once
-        int64_t src0_cur_start = (ith * ne01) / nth;
-        int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+        // ------------------------------------------------------------------- work partition
+        //
+        // Two ways to deal this op out over the pool, picked per op from the row count.
+        //
+        // COLUMNS, the original split. Every thread walks every expert and every group, over
+        // its own slice of the src0 columns. The row work is shared evenly, but the slice is
+        // rounded to NB_COLS so slices differ by up to NB_COLS - 1 columns, and, the larger
+        // cost, the activation panel of a group is interleaved independently by every thread.
+        // That is nth times the work of one panel and it does not shrink with the slice.
+        //
+        // ROWS. Each thread takes a disjoint subset of the (expert, group) work items and
+        // runs each over the FULL column range. The gemm and gemv work per thread is the same
+        // total divided the other way round, the panel of a group is interleaved once instead
+        // of nth times, and there is no NB_COLS rounding left to be uneven about.
+        //
+        // Rows are used when there are at least nth work items, so that every thread has one.
+        // Below that the column split is kept, which is what npl 1 decode needs: one token
+        // routed to 8 experts is 8 single row items, and dealing those out by rows would idle
+        // two of ten threads and hand the other eight a full width gemv each.
+        //
+        // Both are pure work assignments. Either way an output row is computed by exactly one
+        // thread, by the same kernel, from the same inputs, and the dst rows of distinct work
+        // items are disjoint, so the bytes written are the same under both and at every thread
+        // count. Neither changes an accumulation order: the kernels reduce over ne00, and
+        // ncols only selects which output columns a call produces.
 
-        // Align boundaries to NB_COLS - round up to ensure all data is included
-        src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
-        src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
-        if (src0_cur_end > ne01) {
-            src0_cur_end = ne01;
+        // Cost of one row in hundredths of a microsecond, measured on the ten DGX Spark big
+        // cores at npl 64: gemm 0.44 us per row, gemv 1.65 us per row. Only the ratio matters,
+        // both scale with the column width. The per group panel interleave is not weighted;
+        // it is about 2 percent of a full width 4-row group.
+        constexpr int64_t W_GEMM_ROW = 44;
+        constexpr int64_t W_GEMV_ROW = 165;
+
+        // How one expert's rows decompose into work items, exactly as the loop below spends
+        // them: full 4-row gemm groups, then at most one padded group carrying a remainder of
+        // 2 or 3 rows, then a gemv each for whatever is left, which here is 0 or 1 row. This
+        // is the v4 dispatch, not the 2-row gemm2 dispatch it replaced: gemm2 is compiled but
+        // never called, so no work item can be one.
+        //
+        // A padded group is one call into the same 4-row gemm as a full group, over the same
+        // weights, so it is weighted as four gemm rows rather than as the two or three real
+        // rows it carries. What the partition has to even out is time, not rows.
+        auto expert_items = [](int64_t rows, int64_t & n4, int64_t & npad, int64_t & nv) {
+            n4   = 0;
+            npad = 0;
+            nv   = rows;
+            if constexpr (has_interleave) {
+                n4 = rows / 4;
+                nv = rows % 4;
+                if (nv >= 2) {
+                    npad = 1;
+                    nv   = 0;
+                }
+            }
+        };
+
+        // The weight of an expert from its decomposition. Written once so that the running
+        // total, the expert level skip and the per item steps below cannot drift apart: the
+        // partition is only sound while all three agree on what an item costs.
+        auto expert_weight = [](int64_t n4, int64_t npad, int64_t nv) {
+            return 4*(n4 + npad)*W_GEMM_ROW + nv*W_GEMV_ROW;
+        };
+
+        int64_t n_items = 0;
+        int64_t w_total = 0;
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            int64_t n4, npad, nv;
+            expert_items(matrix_row_counts[cur_a], n4, npad, nv);
+            n_items += n4 + npad + nv;
+            w_total += expert_weight(n4, npad, nv);
+        }
+
+        const bool split_rows = n_items >= nth;
+
+        // the src0 column range does not depend on the expert, so split it once
+        int64_t src0_cur_start = split_rows ? 0    : (ith * ne01) / nth;
+        int64_t src0_cur_end   = split_rows ? ne01 : ((ith + 1) * ne01) / nth;
+
+        if (!split_rows) {
+            // Align boundaries to NB_COLS - round up to ensure all data is included
+            src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
+            src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
+            if (src0_cur_end > ne01) {
+                src0_cur_end = ne01;
+            }
         }
 
         if (src0_cur_start >= src0_cur_end) {
@@ -4837,12 +4913,36 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int64_t ncols = src0_cur_end - src0_cur_start;
 
+        // This thread owns the work items whose running weight position falls in [w_lo, w_hi).
+        // Positions are strictly increasing and every item weighs more than nothing, so those
+        // intervals, which partition [0, w_total), give every item to exactly one thread. Each
+        // thread derives the same numbers from the same row counts, so the assignment needs no
+        // coordination and no second barrier.
+        const int64_t w_lo  = split_rows ? (ith       * w_total) / nth : 0;
+        const int64_t w_hi  = split_rows ? ((ith + 1) * w_total) / nth : w_total;
+        int64_t       w_pos = 0;
+
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             if (cne1 == 0) {
                 continue;
+            }
+
+            if (split_rows) {
+                int64_t n4, npad, nv;
+                expert_items(cne1, n4, npad, nv);
+                const int64_t w_expert = expert_weight(n4, npad, nv);
+                if (w_pos + w_expert <= w_lo) {
+                    // every item of this expert sits below our range
+                    w_pos += w_expert;
+                    continue;
+                }
+                if (w_pos >= w_hi) {
+                    // and every item from this expert on sits above it
+                    break;
+                }
             }
 
             const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
@@ -4879,21 +4979,38 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 // full groups of 4 rows through the gemm
                 for (; ir1 + 4 <= cne1; ir1 += 4) {
-                    run_group(ir1, 4);
+                    const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
+                    w_pos += 4*W_GEMM_ROW;
+                    if (mine) {
+                        run_group(ir1, 4);
+                    }
                 }
 
                 // a remainder of 2 or 3 rows, padded to a full group and through the same
-                // gemm. A remainder of 1 is left to gemv: one real row against three padded
-                // ones is three quarters wasted gemm, and it is the batch-of-one case, which
-                // must not regress.
+                // gemm, as one more work item. A remainder of 1 is left to gemv: one real row
+                // against three padded ones is three quarters wasted gemm, and it is the
+                // batch-of-one case, which must not regress.
+                //
+                // It steps w_pos by a full 4-row gemm because that is the call it makes, and
+                // that is what expert_items and expert_weight above charge it.
                 if (cne1 - ir1 >= 2) {
-                    run_group(ir1, cne1 - ir1);
+                    const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
+                    w_pos += 4*W_GEMM_ROW;
+                    if (mine) {
+                        run_group(ir1, cne1 - ir1);
+                    }
                     ir1 = cne1;
                 }
             }
 
             // whatever is left, one gemv each
             for (; ir1 < cne1; ir1++) {
+                const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
+                w_pos += W_GEMV_ROW;
+                if (!mine) {
+                    continue;
+                }
+
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1;  // selected expert index

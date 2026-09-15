@@ -8,10 +8,17 @@
 // a remainder of 2 or 3 rows through the same gemm zero padded to four, then gemv for a
 // remainder of 1, so the interesting variable is the number of rows one expert receives
 // modulo 4: rows 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12 and 17 are all exercised, which covers
-// every remainder 0, 1, 2, 3 both with and without a preceding 4-row group. Three mixed
-// routings additionally scatter the dst rows: 9/9/8/8, and two that give an expert exactly
-// 2 and exactly 3 rows. The results must be identical bit for bit, not merely within
-// tolerance: a padded row must not be able to move a real one.
+// every remainder 0, 1, 2, 3 both with and without a preceding 4-row group. Five mixed
+// routings additionally scatter the dst rows: 9/9/8/8, two that give an expert exactly 2 and
+// exactly 3 rows, and two 88-row routings. The results must be identical bit for bit, not
+// merely within tolerance: a padded row must not be able to move a real one.
+//
+// Thread counts 1, 4 and 10 are all run, because the thread count selects the work partition
+// as well as the number of workers. forward_mul_mat_id splits the op by src0 columns when
+// there are fewer work items than threads and by (expert, group) work items at full column
+// width otherwise, so 1 thread is always full width, and the 88-row routings carry more than
+// 10 work items and therefore exercise the row partition at all three counts. 10 threads on
+// a 4 or 5 core box is oversubscribed, which is fine: this test times nothing.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -139,7 +146,7 @@ int main(void) {
     const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
     const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
     const int64_t tokens[]    = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 17 };
-    const int     threads[]   = { 1, 4 };
+    const int     threads[]   = { 1, 4, 10 };
     const int64_t n_as        = 4;
 
     std::mt19937 rng(1234);
@@ -246,7 +253,11 @@ int main(void) {
             //         the dst rows scattered as in case 2. 2/3/4/1 has no 4-row group before
             //         the pair, 6/7/2/3 does.
             {
-                const int routings[2][4] = { { 2, 3, 4, 1 }, { 6, 7, 2, 3 } };
+                // The last two are 88 rows over the four experts, which is more than 10 work
+                // items however they fall, so the (expert, group) row partition is live at
+                // every thread count this test runs.
+                const int routings[4][4] = { { 2, 3, 4, 1 }, { 6, 7, 2, 3 },
+                                             { 40, 9, 23, 16 }, { 17, 31, 22, 18 } };
                 for (const auto & counts : routings) {
                     const int64_t n_used = 2;
                     const int64_t n_rows = counts[0] + counts[1] + counts[2] + counts[3];
