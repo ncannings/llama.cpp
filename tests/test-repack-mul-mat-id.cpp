@@ -1,12 +1,16 @@
 // Checks ggml_mul_mat_id over a repacked (CPU_REPACK) 3D weight against the un-repacked
-// reference path. TQ2_0 (q8_K activations) takes the new 4-row gemm batching and must be
-// identical bit for bit. Q4_0 (q8_0 activations) is carried as a non-regression control: its
-// repack kernels are not bit-exact against the reference even for a single row on the
-// untouched gemv path, so it is checked against the usual 1e-3 relative tolerance instead. The repack path groups the rows routed to one expert into 4-row gemm
-// calls and zero pads the tail group, so the interesting variable is the number of rows
-// one expert receives: 1, 2, 3, 4, 5, 8, 12 and 17 are all exercised, plus a mixed
-// routing that gives different experts different counts. The results must be identical
-// bit for bit, not merely within tolerance.
+// reference path. TQ2_0 (q8_K activations) takes the gemm batching and must be identical bit
+// for bit. Q4_0 (q8_0 activations) is carried as a non-regression control: its repack
+// kernels are not bit-exact against the reference even for a single row on the untouched
+// gemv path, so it is checked against the usual 1e-3 relative tolerance instead.
+//
+// The repack path dispatches the rows routed to one expert as 4-row gemm calls, then one
+// 2-row gemm, then gemv for whatever is left, so the interesting variable is the number of
+// rows one expert receives modulo 4: rows 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12 and 17 are all
+// exercised, which covers every remainder 0, 1, 2, 3 both with and without a preceding
+// 4-row group. Three mixed routings additionally scatter the dst rows: 9/9/8/8, and two that
+// give an expert exactly 2 and exactly 3 rows. The results must be identical bit for bit,
+// not merely within tolerance.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -48,6 +52,23 @@ static bool type_is_repacked(ggml_backend_buffer_type_t buft, ggml_type wtype) {
     ggml_backend_buffer_free(buf_w);
     ggml_free(ctx_w);
     return repacked;
+}
+
+// Build a routing that gives expert e exactly counts[e] rows, dealing the experts out round
+// robin so that one expert's rows are scattered over the tokens rather than contiguous.
+static std::vector<int32_t> ids_from_counts(const int counts[4], int64_t n_as, int64_t n_slots) {
+    std::vector<int> left(counts, counts + n_as);
+    std::vector<int32_t> ids;
+    ids.reserve(n_slots);
+    while ((int64_t) ids.size() < n_slots) {
+        for (int64_t e = 0; e < n_as; e++) {
+            if (left[e] > 0 && (int64_t) ids.size() < n_slots) {
+                ids.push_back((int32_t) e);
+                left[e]--;
+            }
+        }
+    }
+    return ids;
 }
 
 // dst[n][iu][t] = sum_k W[ids[iu][t]][n][k] * X[t][iu][k]
@@ -116,7 +137,7 @@ int main(void) {
 
     const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
     const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
-    const int64_t tokens[]    = { 1, 2, 3, 4, 5, 8, 12, 17 };
+    const int64_t tokens[]    = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 17 };
     const int     threads[]   = { 1, 4 };
     const int64_t n_as        = 4;
 
@@ -217,6 +238,46 @@ int main(void) {
                        ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
                        max_abs, max_diff, pass ? "OK" : "FAIL");
                 ok = ok && pass;
+            }
+
+            // case 3: mixed routings chosen so that one expert receives exactly 2 rows and
+            //         another exactly 3, the two counts the 2-row gemm is there for, with
+            //         the dst rows scattered as in case 2. 2/3/4/1 has no 4-row group before
+            //         the pair, 6/7/2/3 does.
+            {
+                const int routings[2][4] = { { 2, 3, 4, 1 }, { 6, 7, 2, 3 } };
+                for (const auto & counts : routings) {
+                    const int64_t n_used = 2;
+                    const int64_t n_rows = counts[0] + counts[1] + counts[2] + counts[3];
+                    const int64_t n_tok  = n_rows / n_used;
+                    std::vector<float> x(K * n_used * n_tok);
+                    for (auto & v : x) {
+                        v = dist(rng);
+                    }
+                    const std::vector<int32_t> ids = ids_from_counts(counts, n_as, n_used * n_tok);
+
+                    std::vector<float> out_ref;
+                    std::vector<float> out_rep;
+                    if (!run_mul_mat_id(backend, buft_ref, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_ref, false)) {
+                        return 1;
+                    }
+                    if (!run_mul_mat_id(backend, buft_repack, wtype, w_q, K, N, n_as, x, n_used, n_tok, ids, out_rep, true)) {
+                        return 1;
+                    }
+
+                    float max_abs = 0.0f;
+                    float max_diff = 0.0f;
+                    for (size_t i = 0; i < out_ref.size(); i++) {
+                        max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
+                        max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
+                    }
+                    const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
+                    const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                    printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                           ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
+                           max_abs, max_diff, pass ? "OK" : "FAIL");
+                    ok = ok && pass;
+                }
             }
         }
 
