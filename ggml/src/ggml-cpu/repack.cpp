@@ -812,7 +812,10 @@ static void ggml_gemv_tq2_0_NxM_q8_K_generic_impl(int                        n,
     }
 }
 
-template <int M, int N>
+// NROWS is the number of activation rows of the block_q8_Kx4 panel that are actually
+// computed: 4 for the full gemm, 2 for the row-pair gemm2. The panel layout is the same in
+// both cases, rows NROWS .. 3 are simply never read.
+template <int M, int N, int NROWS = 4>
 static void ggml_gemm_tq2_0_NxM_q8_K_generic_impl(int                        n,
                                                   float * GGML_RESTRICT      s,
                                                   size_t                     bs,
@@ -826,25 +829,25 @@ static void ggml_gemm_tq2_0_NxM_q8_K_generic_impl(int                        n,
     const int     nb                = n / qk;
 
     assert(n % qk == 0);
-    assert(nr % 4 == 0);
+    assert(nr % NROWS == 0);
     assert(nc % ncols_interleaved == 0);
 
-    float   sumf[4][ncols_interleaved];
-    int32_t sumi[4][ncols_interleaved];
-    int32_t bsum[4];
+    float   sumf[NROWS][ncols_interleaved];
+    int32_t sumi[NROWS][ncols_interleaved];
+    int32_t bsum[NROWS];
 
-    for (int y = 0; y < nr / 4; y++) {
+    for (int y = 0; y < nr / NROWS; y++) {
         const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb);
         for (int x = 0; x < nc / ncols_interleaved; x++) {
             const block_tq2_0x8 * b_ptr = (const block_tq2_0x8 *) vx + (x * nb);
-            for (int m = 0; m < 4; m++) {
+            for (int m = 0; m < NROWS; m++) {
                 for (int j = 0; j < ncols_interleaved; j++) {
                     sumf[m][j] = 0.0f;
                 }
             }
             for (int l = 0; l < nb; l++) {
                 // block_q8_Kx4 stores the 16 bsums of row m in groups of four at (g / 4) * 16 + m * 4 + g % 4
-                for (int m = 0; m < 4; m++) {
+                for (int m = 0; m < NROWS; m++) {
                     bsum[m] = 0;
                     for (int g = 0; g < QK_K / 16; g++) {
                         bsum[m] += a_ptr[l].bsums[(g / 4) * 16 + m * 4 + (g % 4)];
@@ -863,22 +866,22 @@ static void ggml_gemm_tq2_0_NxM_q8_K_generic_impl(int                        n,
                                 // row m element e of block_q8_Kx4 sits at (e / blocklen) * 4 * blocklen + m * blocklen + e % blocklen
                                 const int q8_offset = (e / blocklen) * 4 * blocklen + (e % blocklen);
                                 const int w         = (q >> (2 * sh)) & 3;
-                                for (int m = 0; m < 4; m++) {
+                                for (int m = 0; m < NROWS; m++) {
                                     sumi[m][j] += w * a_ptr[l].qs[q8_offset + m * blocklen];
                                 }
                             }
                         }
                     }
                 }
-                for (int m = 0; m < 4; m++) {
+                for (int m = 0; m < NROWS; m++) {
                     for (int j = 0; j < ncols_interleaved; j++) {
                         sumf[m][j] += (float) (sumi[m][j] - bsum[m]) * (GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a_ptr[l].d[m]);
                     }
                 }
             }
-            for (int m = 0; m < 4; m++) {
+            for (int m = 0; m < NROWS; m++) {
                 for (int j = 0; j < ncols_interleaved; j++) {
-                    s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+                    s[(y * NROWS + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
                 }
             }
         }
@@ -2239,6 +2242,11 @@ void ggml_gemm_tq2_0_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
 
 void ggml_gemm_tq2_0_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     ggml_gemm_tq2_0_NxM_q8_K_generic_impl<8, 8>(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm2_tq2_0_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(nr == 2);
+    ggml_gemm_tq2_0_NxM_q8_K_generic_impl<8, 8, 2>(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_iq4_nl_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -4378,6 +4386,25 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 }
 #endif
 
+// gemm2: a GEMM over exactly two activation rows. The i8mm kernel's natural activation
+// granularity is a row pair (one vmmlaq_s32 consumes 2 rows x 8 columns), so a pair of rows
+// can be served by one pass over the weights instead of two gemv passes. Only the TQ2_0 8x8
+// i8mm kernel has one. Everything else keeps has_gemm2 false and leaves 2-row groups on
+// gemv, in particular the TQ2_0 8x4 dotprod kernel, which this machine's build never
+// selects (i8mm is present) and where a 2-row variant could therefore not be held to the
+// bit-identity bar the rest of this work is held to.
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
+constexpr bool has_gemm2 = false;
+
+template <> constexpr bool has_gemm2<block_tq2_0, 8, 8, GGML_TYPE_Q8_K> = true;
+
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
+void gemm2(int, float *, size_t, const void *, const void *, int, int);
+
+template <> void gemm2<block_tq2_0, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm2_tq2_0_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
+}
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -4628,21 +4655,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     static constexpr bool has_interleave =
         PARAM_TYPE == GGML_TYPE_Q8_K && (INTER_SIZE == 4 || INTER_SIZE == 8);
 
-    // Assemble the 4-row interleaved activation panel for one group out of four already
-    // quantised rows. Scales, quants and block sums are copied unchanged and only their
-    // position in the buffer changes, so this is exactly the panel ggml_quantize_mat_t would
-    // have produced from the same four source rows, without quantising anything again.
+    // Assemble the interleaved activation panel for one group out of already quantised rows.
+    // Scales, quants and block sums are copied unchanged and only their position in the
+    // buffer changes, so this is exactly the panel ggml_quantize_mat_t would have produced
+    // from the same source rows, without quantising anything again.
     // The placement rule is read off ggml_quantize_mat_q8_K_4x4 and _4x8:
     // qs[c*4*BL + r*BL + t] = row r, element c*BL + t, and
     // bsums[(sb/4)*16 + r*4 + (sb%4)] = row r, sub block sb.
-    static void interleave_4_rows(const char * const rows[4], char * panel, int64_t n_per_row) {
+    // nrows is 4 for the full gemm and 2 for gemm2. With nrows 2 the slots of rows 2 and 3
+    // are left untouched: gemm2 reads neither their quants, nor their scales, nor their
+    // block sums, so nothing has to be written there and nothing has to be zeroed.
+    static void interleave_rows(const char * const rows[4], int64_t nrows, char * panel, int64_t n_per_row) {
         constexpr int64_t BL = INTER_SIZE; // blck_size_interleave
 
         if constexpr (PARAM_TYPE == GGML_TYPE_Q8_K) {
             const int64_t nb = n_per_row / QK_K;
             auto * y = (block_q8_Kx4 *) panel;
             for (int64_t b = 0; b < nb; b++) {
-                for (int64_t r = 0; r < 4; r++) {
+                for (int64_t r = 0; r < nrows; r++) {
                     const block_q8_K * x = (const block_q8_K *) rows[r] + b;
                     y[b].d[r] = x->d;
                     for (int64_t c = 0; c < QK_K/BL; c++) {
@@ -4654,15 +4684,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             }
         } else {
-            GGML_ABORT("no 4-row activation interleave for this parameter type");
+            GGML_ABORT("no activation interleave for this parameter type");
         }
     }
 
     // MUL_MAT_ID over a repacked src0. Each activation row is quantised exactly once, as
     // before. The rows routed to one expert are then taken four at a time through the same
     // 4-row gemm that forward_mul_mat uses, with the panel assembled by permuting those four
-    // quantised rows in per-thread scratch; the 1 to 3 rows left over go through gemv, which
-    // is the original path unchanged. Nothing is padded and no extra barrier is needed.
+    // quantised rows in per-thread scratch. Where a 2-row gemm exists, one further pair is
+    // taken through it, so a group of 2 or 3 rows costs one pass over the expert weights
+    // rather than two or three. The 0 or 1 row left over goes through gemv, which is the
+    // original path unchanged. Nothing is padded and no extra barrier is needed.
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -4786,30 +4818,52 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             int64_t ir1 = 0;
 
             if constexpr (has_interleave) {
-                // full groups of 4 rows through the gemm
-                for (; ir1 + 4 <= cne1; ir1 += 4) {
+                // gather the group's quantised rows, run one gemm over them and scatter the
+                // result: the dst rows of one expert are not contiguous, so the gemm writes
+                // a contiguous per-thread tile which is then copied out row by row
+                auto run_group = [&](int64_t first, int64_t nrows) {
                     const char * rows[4];
-                    for (int64_t ir = 0; ir < 4; ++ir) {
-                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + ir);
+                    for (int64_t ir = 0; ir < nrows; ++ir) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + ir);
                         rows[ir] = wdata + (rm.i1 % ne11)*nbw1 + (int64_t) rm.i2*nbw2;
                     }
 
-                    interleave_4_rows(rows, panel, ne10);
+                    interleave_rows(rows, nrows, panel, ne10);
 
-                    // dst rows of one expert are scattered, so the gemm writes a contiguous tile
-                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                        ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 4, ncols);
+                    if (nrows == 4) {
+                        gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                            ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 4, ncols);
+                    } else if constexpr (has_gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>) {
+                        // only reached for a type that has a 2-row gemm, and only with nrows 2
+                        gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                            ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 2, ncols);
+                    } else {
+                        GGML_ABORT("no 2-row gemm for this parameter type");
+                    }
 
-                    for (int64_t ir = 0; ir < 4; ++ir) {
-                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + ir);
+                    for (int64_t ir = 0; ir < nrows; ++ir) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + ir);
                         memcpy((float *) ((char *) dst->data + (rm.i1 * nb1 + (int64_t) rm.i2 * nb2)) + src0_cur_start,
                                dst_tile + ir*ncols,
                                ncols*sizeof(float));
                     }
+                };
+
+                // full groups of 4 rows through the gemm
+                for (; ir1 + 4 <= cne1; ir1 += 4) {
+                    run_group(ir1, 4);
+                }
+
+                // then at most one pair of the 1 to 3 rows left over, through the 2-row gemm
+                if constexpr (has_gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>) {
+                    if (ir1 + 2 <= cne1) {
+                        run_group(ir1, 2);
+                        ir1 += 2;
+                    }
                 }
             }
 
-            // the 1 to 3 rows left over, one gemv each
+            // whatever is left, one gemv each
             for (; ir1 < cne1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 

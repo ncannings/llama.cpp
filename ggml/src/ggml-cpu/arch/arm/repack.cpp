@@ -5183,6 +5183,17 @@ static inline int32x4_t tq2_0_q8_Kx4_bsum(const block_q8_Kx4 * q8) {
     }
     return vpaddlq_s16(vpaddq_s16(lo, hi));
 }
+
+// Same, for a panel of which only the first row pair is populated: lanes 0 and 1 are tokens
+// 0 and 1 and carry the identical integers, lanes 2 and 3 repeat them and are discarded.
+// bsums of rows 2 and 3 are not read.
+static inline int32x4_t tq2_0_q8_Kx4_bsum_01(const block_q8_Kx4 * q8) {
+    int16x8_t lo = vld1q_s16(q8->bsums);       // t0 x4, t1 x4
+    for (int g = 1; g < 4; g++) {
+        lo = vaddq_s16(lo, vld1q_s16(q8->bsums + 16 * g));
+    }
+    return vpaddlq_s16(vpaddq_s16(lo, lo));
+}
 #endif
 
 void ggml_gemv_tq2_0_8x4_q8_K(int                        n,
@@ -5641,4 +5652,148 @@ void ggml_gemm_tq2_0_8x8_q8_K(int                        n,
     return;
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     ggml_gemm_tq2_0_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// 2-row TQ2_0 GEMM, i8mm. vmmlaq_s32 consumes exactly two activation rows per instruction,
+// so ggml_gemm_tq2_0_8x8_q8_K above is already two independent halves: acc[0..3] hold the
+// tokens 0,1 tiles and acc[4..7] the tokens 2,3 tiles, and nothing crosses between them.
+// This kernel is the tokens 0,1 half of it, instruction for instruction, with the tokens 2,3
+// loads and accumulators dropped. The activation panel is still a block_q8_Kx4, built by
+// interleave_rows for two rows; rows 2 and 3 of it are never read, neither their quants, nor
+// their scales, nor their block sums. Weight loads, integer accumulation order, the bsum
+// subtraction and the association of the two scales are identical to the 4-row kernel, which
+// is why the output is bit identical to it and therefore to the single-row gemv.
+void ggml_gemm2_tq2_0_8x8_q8_K(int                        n,
+                               float * GGML_RESTRICT      s,
+                               size_t                     bs,
+                               const void * GGML_RESTRICT vx,
+                               const void * GGML_RESTRICT vy,
+                               int                        nr,
+                               int                        nc) {
+    constexpr int qk = QK_K;
+    const int     nb = n / qk;
+
+    constexpr int ncols_interleaved = 8;
+    constexpr int blocklen          = 8;
+
+    assert(n % qk == 0);
+    assert(nr == 2);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(nb);
+    UNUSED(nr);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    const uint8x16_t m3 = vdupq_n_u8(3);
+
+    const block_q8_Kx4 * GGML_RESTRICT q8_ptr = (const block_q8_Kx4 *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_tq2_0x8 * GGML_RESTRICT tq_ptr = (const block_tq2_0x8 *) vx + (x * nb);
+
+        // 2x8 tile: acc_f32[2*m + c] = token m, columns 4c .. 4c+3
+        float32x4_t acc_f32[4];
+        for (int i = 0; i < 4; i++) {
+            acc_f32[i] = vdupq_n_f32(0);
+        }
+
+        for (int b = 0; b < nb; b++) {
+            // acc[cp] = 2x2 tile of column pair cp x tokens 01
+            int32x4_t acc[4];
+            for (int i = 0; i < 4; i++) {
+                acc[i] = vdupq_n_s32(0);
+            }
+
+            for (int h = 0; h < 2; h++) {
+                for (int k = 0; k < 4; k++) {
+                    // chunk (h*4 + k) = 64 bytes: 8 columns x source bytes h*32 + k*8 .. +7.
+                    // One 16-byte load is a column pair with 8 codes each: a ready MMLA LHS.
+                    const uint8_t *  tq_base = tq_ptr[b].qs + (h * 4 + k) * 64;
+                    const uint8x16_t w0      = vld1q_u8(tq_base);
+                    const uint8x16_t w1      = vld1q_u8(tq_base + 16);
+                    const uint8x16_t w2      = vld1q_u8(tq_base + 32);
+                    const uint8x16_t w3      = vld1q_u8(tq_base + 48);
+
+                    // q8_Kx4 group g = 32 bytes: [tokens 01][tokens 23], 8 elements each, g = h*16 + sh*4 + k.
+                    // Only the tokens 01 half of each group is read.
+                    const int8_t * q8_base = q8_ptr[b].qs + (h * 16 + k) * 32;
+
+                    const int8x16_t q8_01_0 = vld1q_s8(q8_base + 0 * 128);
+                    const int8x16_t c0_0    = tq2_0_codes_0(w0, m3);
+                    const int8x16_t c0_1    = tq2_0_codes_0(w1, m3);
+                    const int8x16_t c0_2    = tq2_0_codes_0(w2, m3);
+                    const int8x16_t c0_3    = tq2_0_codes_0(w3, m3);
+                    acc[0] = vmmlaq_s32(acc[0], c0_0, q8_01_0);
+                    acc[1] = vmmlaq_s32(acc[1], c0_1, q8_01_0);
+                    acc[2] = vmmlaq_s32(acc[2], c0_2, q8_01_0);
+                    acc[3] = vmmlaq_s32(acc[3], c0_3, q8_01_0);
+
+                    const int8x16_t q8_01_1 = vld1q_s8(q8_base + 1 * 128);
+                    const int8x16_t c2_0    = tq2_0_codes_2(w0, m3);
+                    const int8x16_t c2_1    = tq2_0_codes_2(w1, m3);
+                    const int8x16_t c2_2    = tq2_0_codes_2(w2, m3);
+                    const int8x16_t c2_3    = tq2_0_codes_2(w3, m3);
+                    acc[0] = vmmlaq_s32(acc[0], c2_0, q8_01_1);
+                    acc[1] = vmmlaq_s32(acc[1], c2_1, q8_01_1);
+                    acc[2] = vmmlaq_s32(acc[2], c2_2, q8_01_1);
+                    acc[3] = vmmlaq_s32(acc[3], c2_3, q8_01_1);
+
+                    const int8x16_t q8_01_2 = vld1q_s8(q8_base + 2 * 128);
+                    const int8x16_t c4_0    = tq2_0_codes_4(w0, m3);
+                    const int8x16_t c4_1    = tq2_0_codes_4(w1, m3);
+                    const int8x16_t c4_2    = tq2_0_codes_4(w2, m3);
+                    const int8x16_t c4_3    = tq2_0_codes_4(w3, m3);
+                    acc[0] = vmmlaq_s32(acc[0], c4_0, q8_01_2);
+                    acc[1] = vmmlaq_s32(acc[1], c4_1, q8_01_2);
+                    acc[2] = vmmlaq_s32(acc[2], c4_2, q8_01_2);
+                    acc[3] = vmmlaq_s32(acc[3], c4_3, q8_01_2);
+
+                    const int8x16_t q8_01_3 = vld1q_s8(q8_base + 3 * 128);
+                    const int8x16_t c6_0    = tq2_0_codes_6(w0);
+                    const int8x16_t c6_1    = tq2_0_codes_6(w1);
+                    const int8x16_t c6_2    = tq2_0_codes_6(w2);
+                    const int8x16_t c6_3    = tq2_0_codes_6(w3);
+                    acc[0] = vmmlaq_s32(acc[0], c6_0, q8_01_3);
+                    acc[1] = vmmlaq_s32(acc[1], c6_1, q8_01_3);
+                    acc[2] = vmmlaq_s32(acc[2], c6_2, q8_01_3);
+                    acc[3] = vmmlaq_s32(acc[3], c6_3, q8_01_3);
+                }
+            }
+
+            // Reorder the 2x2 MMLA tiles into per-token rows of 4 columns, exactly the
+            // tokens 0,1 quarter of the 4-row kernel's shuffle
+            for (int i = 0; i < 4; i++) {
+                int32x2x2_t aux = vzip_s32(vget_low_s32(acc[i]), vget_high_s32(acc[i]));
+                acc[i]          = vcombine_s32(aux.val[0], aux.val[1]);
+            }
+            const int32x4_t sumi[4] = {
+                vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
+                vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
+                vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
+                vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
+            };
+
+            int32_t bsum[4];
+            vst1q_s32(bsum, tq2_0_q8_Kx4_bsum_01(&q8_ptr[b]));
+            const float32x4_t tq_d_0 = vcvt_f32_f16(vld1_f16((const __fp16 *) tq_ptr[b].d));
+            const float32x4_t tq_d_1 = vcvt_f32_f16(vld1_f16((const __fp16 *) tq_ptr[b].d + 4));
+            for (int m = 0; m < 2; m++) {
+                const float32x4_t q8_d   = vdupq_n_f32(q8_ptr[b].d[m]);
+                const int32x4_t   bsum_m = vdupq_n_s32(bsum[m]);
+                acc_f32[2 * m]     = vfmaq_f32(acc_f32[2 * m],     vmulq_f32(tq_d_0, q8_d), vcvtq_f32_s32(vsubq_s32(sumi[2 * m],     bsum_m)));
+                acc_f32[2 * m + 1] = vfmaq_f32(acc_f32[2 * m + 1], vmulq_f32(tq_d_1, q8_d), vcvtq_f32_s32(vsubq_s32(sumi[2 * m + 1], bsum_m)));
+            }
+        }  // for b
+
+        for (int m = 0; m < 2; m++) {
+            float * dst = s + m * bs + x * ncols_interleaved;
+            vst1q_f32(dst, acc_f32[2 * m]);
+            vst1q_f32(dst + 4, acc_f32[2 * m + 1]);
+        }
+    }  // for x
+    return;
+#endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    ggml_gemm2_tq2_0_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }
