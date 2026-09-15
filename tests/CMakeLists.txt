@@ -338,6 +338,12 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-repack-tq2_0.cpp)
     llama_build_and_test(test-repack-mul-mat-id.cpp)
+    llama_build_and_test(test-repack-q4_K-head.cpp)
+    # this one calls the repacked q4_K gemm kernels directly, so it needs the ggml-cpu
+    # internal headers (repack.h, traits.h, ggml-common.h)
+    target_include_directories(test-repack-q4_K-head PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
