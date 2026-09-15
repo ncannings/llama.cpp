@@ -1240,8 +1240,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                 //}
 
+                // F32 against F32 is the one type whose vec_dot takes no quantised panel and
+                // whose src0 rows are plain float, so the whole block of output columns can
+                // share one pass over the activation instead of re-reading it once per
+                // column. ggml_vec_dot_f32_nc keeps each output element's accumulation order
+                // over ne00 exactly as ggml_vec_dot_f32 has it, so the result is unchanged
+                // bit for bit; use_ref keeps the original loop available as the reference.
+                if (type == GGML_TYPE_F32 && num_rows_per_vec_dot == 1 && !params->use_ref) {
+                    ggml_vec_dot_f32_nc(ne00, (int) (MIN(iir0 + blck_0, ir0_end) - iir0), tmp,
+                                        (const float *) (src0_row + iir0 * nb01), nb01,
+                                        (const float *) src1_col);
+                } else {
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
