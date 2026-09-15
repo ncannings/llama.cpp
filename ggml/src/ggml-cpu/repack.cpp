@@ -11,6 +11,7 @@
 
 #include "arch-fallback.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -4411,6 +4412,11 @@ template <> void gemm2<block_tq2_0, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size
     ggml_gemm2_tq2_0_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
 
+// Size and alignment of the MUL_MAT_ID work-stealing counter's slot in wdata. One cache line
+// so the counter never shares a line with the per-thread scratch that follows it. Declared
+// here because both work_size() and forward_mul_mat_id() have to agree on it.
+static constexpr size_t MMID_STEAL_ALIGN = 64;
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -4439,6 +4445,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+
+                    // the op's own work-stealing counter, alone on a cache line so that the
+                    // threads hammering it do not share a line with the scratch below
+                    size  = GGML_PAD(size, MMID_STEAL_ALIGN);
+                    size += MMID_STEAL_ALIGN;
 
                     // per thread: the 4-row interleaved activation panel of one group, and the
                     // 4 x ne01 f32 tile the gemm writes before the rows are scattered to dst
@@ -4764,6 +4775,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         size_t woff = (size_t) (wdata_src1_end - wdata) + sizeof(int64_t)*(size_t) n_as*(ne12 + 1);
 
+        // The op's own work-stealing counter. It is NOT the threadpool's shared current_chunk;
+        // see the work partition comment below for why that distinction is the whole safety
+        // argument. int64_t so the chunk index cannot wrap, on its own cache line.
+        woff = GGML_PAD(woff, MMID_STEAL_ALIGN);
+        auto * const steal_ctr = (std::atomic<int64_t> *) (wdata + woff);
+        woff += MMID_STEAL_ALIGN;
+
         // per thread scratch: the interleaved panel of one group, and the gemm output tile
         woff = GGML_PAD(woff, 64);
         char * const panel = wdata + woff + (size_t) ith*4*nbw1;
@@ -4816,6 +4834,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            // Reset the work-stealing counter for THIS op, in the same pre-pass and under the
+            // same single-writer guard as matrix_row_counts, so the barrier below publishes
+            // both. nth rather than 0 because chunks 0 .. nth-1 are pre-assigned to threads
+            // 0 .. nth-1 below, exactly as forward_mul_mat does with the threadpool counter.
+            steal_ctr->store(nth, std::memory_order_relaxed);
         }
 
         ggml_barrier(params->threadpool);
@@ -4845,13 +4869,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // items are disjoint, so the bytes written are the same under both and at every thread
         // count. Neither changes an accumulation order: the kernels reduce over ne00, and
         // ncols only selects which output columns a call produces.
-
-        // Cost of one row in hundredths of a microsecond, measured on the ten DGX Spark big
-        // cores at npl 64: gemm 0.44 us per row, gemv 1.65 us per row. Only the ratio matters,
-        // both scale with the column width. The per group panel interleave is not weighted;
-        // it is about 2 percent of a full width 4-row group.
-        constexpr int64_t W_GEMM_ROW = 44;
-        constexpr int64_t W_GEMV_ROW = 165;
+        //
+        // The ROWS deal is DYNAMIC. The item list is the same as before, but a thread claims
+        // a chunk of it at a time from an atomic counter instead of owning a fixed interval.
+        // The reason is measured, not aesthetic: on the ten GB10 big cores the pool straddles
+        // two L3 domains, five cores on 8 MB and five on 16 MB, and five threads run the same
+        // expert GEMM about 1.2x slower than the other five. An equal deal (1.03 max over
+        // mean by item count in the v6 profile) therefore still ends with five threads waiting
+        // 15 to 22 ms on a 77 ms step. Stealing lets the fast five simply take more items.
+        //
+        // WHICH thread runs an item is now nondeterministic. WHAT is computed is not: the
+        // paragraph above does not depend on the assignment, so the output bytes are fixed.
 
         // How one expert's rows decompose into work items, exactly as the loop below spends
         // them: full 4-row gemm groups, then at most one padded group carrying a remainder of
@@ -4859,37 +4887,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // is the v4 dispatch, not the 2-row gemm2 dispatch it replaced: gemm2 is compiled but
         // never called, so no work item can be one.
         //
-        // A padded group is one call into the same 4-row gemm as a full group, over the same
-        // weights, so it is weighted as four gemm rows rather than as the two or three real
-        // rows it carries. What the partition has to even out is time, not rows.
-        auto expert_items = [](int64_t rows, int64_t & n4, int64_t & npad, int64_t & nv) {
-            n4   = 0;
-            npad = 0;
-            nv   = rows;
+        // Written once, because the running item index, the expert level skip and the per
+        // item steps below are only consistent while all three agree on what an item is.
+        //
+        // There are no cost weights any more. A full group is 4 gemm rows and the measured
+        // per row costs are 0.44 us (gemm) against 1.65 us (gemv), so a group and a gemv are
+        // within 7 percent of each other and counting items IS the weighting. Anything the
+        // weights used to buy is now bought better by the counter, which balances against
+        // what the cores actually do rather than against a cost model.
+        auto expert_items = [](int64_t rows) -> int64_t {
             if constexpr (has_interleave) {
-                n4 = rows / 4;
-                nv = rows % 4;
-                if (nv >= 2) {
-                    npad = 1;
-                    nv   = 0;
-                }
+                const int64_t rem = rows % 4;
+                return rows/4 + (rem >= 2 ? 1 : rem);
+            } else {
+                return rows;
             }
         };
 
-        // The weight of an expert from its decomposition. Written once so that the running
-        // total, the expert level skip and the per item steps below cannot drift apart: the
-        // partition is only sound while all three agree on what an item costs.
-        auto expert_weight = [](int64_t n4, int64_t npad, int64_t nv) {
-            return 4*(n4 + npad)*W_GEMM_ROW + nv*W_GEMV_ROW;
-        };
-
         int64_t n_items = 0;
-        int64_t w_total = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            int64_t n4, npad, nv;
-            expert_items(matrix_row_counts[cur_a], n4, npad, nv);
-            n_items += n4 + npad + nv;
-            w_total += expert_weight(n4, npad, nv);
+            n_items += expert_items(matrix_row_counts[cur_a]);
         }
 
         const bool split_rows = n_items >= nth;
@@ -4913,14 +4930,73 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int64_t ncols = src0_cur_end - src0_cur_start;
 
-        // This thread owns the work items whose running weight position falls in [w_lo, w_hi).
-        // Positions are strictly increasing and every item weighs more than nothing, so those
-        // intervals, which partition [0, w_total), give every item to exactly one thread. Each
-        // thread derives the same numbers from the same row counts, so the assignment needs no
-        // coordination and no second barrier.
-        const int64_t w_lo  = split_rows ? (ith       * w_total) / nth : 0;
-        const int64_t w_hi  = split_rows ? ((ith + 1) * w_total) / nth : w_total;
-        int64_t       w_pos = 0;
+        // ------------------------------------------------------- the work-stealing counter
+        //
+        // Items are numbered 0 .. n_items-1 in the order the expert loop below reaches them.
+        // Every thread derives that numbering from the same matrix_row_counts, so the LIST is
+        // identical on every thread; only the claims differ. A claim is a chunk of CHUNK
+        // consecutive item indices, and chunk index c covers [c*chunk, (c+1)*chunk).
+        //
+        // WHY THE COUNTER LIVES IN wdata AND NOT IN THE THREADPOOL.
+        //
+        // forward_mul_mat uses the threadpool's single shared current_chunk and primes it with
+        // ggml_threadpool_chunk_set before the barrier it already has. That is correct only
+        // because ggml_graph_compute_thread puts a pool-wide ggml_barrier after every node, so
+        // no thread can still be draining the previous op's chunk loop when the next op primes
+        // the field. The earlier fuse work removed that separation and this is exactly what
+        // broke: a shared counter primed while other threads were still fetch_adding it on the
+        // previous op corrupted decode. A single field shared by every op in the graph has a
+        // lifetime longer than any one op, and priming it early is a claim about ops the op
+        // cannot see.
+        //
+        // This counter's lifetime is exactly matrix_row_counts' lifetime. It is written once,
+        // by the pre-pass thread, inside the same ith == 0 block, and read only between this
+        // op's barrier and this op's return. Anything that would let a late thread see a
+        // clobbered counter would already let it see clobbered row counts, so the counter adds
+        // no constraint that MUL_MAT_ID did not already impose. Nothing outside this op can
+        // touch it, so it also does not serialise this op against an unrelated MUL_MAT the way
+        // the shared field would. This is the same shape as upstream's own non-repack
+        // ggml_compute_forward_mul_mat_id, which keeps its per-expert atomic_current_chunk
+        // array in wdata for the same reason.
+        //
+        // NO SECOND BARRIER. The op already has one barrier and it is already in the right
+        // place: after the single-threaded pre-pass and before any thread looks at the row
+        // counts. The store above sits inside that pre-pass, so the barrier publishes the
+        // counter for free. ggml_barrier's enter and exit are seq_cst fences, so thread 0's
+        // relaxed store is ordered before every other thread's first fetch_add.
+        //
+        // CHUNK SIZE. Aim at about 4 claims per thread, as forward_mul_mat does, clamped to
+        // 8 so the tail cannot be lumpy and to 1 so it is always legal. At npl 64 that is
+        // around 180 items over 10 threads, chunk 4, about 45 fetch_adds per op.
+        const int64_t chunk = split_rows
+            ? MAX((int64_t) 1, MIN((int64_t) 8, n_items / (4*(int64_t) nth)))
+            : 1;
+
+        // The first claim is our own thread index, which is why the counter starts at nth:
+        // chunks 0 .. nth-1 are spoken for without anybody touching the counter.
+        int64_t claim_lo = split_rows ? (int64_t) ith * chunk : 0;
+        int64_t claim_hi = claim_lo + chunk;
+
+        // Is item idx ours? Claim forward until the window covers idx, then answer. A thread's
+        // own fetch_add results strictly increase and idx only ever moves forward, so each
+        // item is tested against exactly one window and no item is tested twice.
+        //
+        // EXACTLY ONCE. Chunk indices partition the item list, and each index is held by one
+        // thread: 0 .. nth-1 by construction, the rest because each fetch_add returns a value
+        // no other fetch_add returns. A thread stops only when it holds a window with
+        // claim_lo >= n_items, and the counter only ever increases, so every index below that
+        // has already been handed out; a thread never abandons a window it has not walked,
+        // because the only exit from the expert loop is that same claim_lo >= n_items test.
+        // So every item is run, by one thread.
+        auto own = [&](int64_t idx) -> bool {
+            while (idx >= claim_hi) {
+                claim_lo = steal_ctr->fetch_add(1, std::memory_order_relaxed) * chunk;
+                claim_hi = claim_lo + chunk;
+            }
+            return idx >= claim_lo;
+        };
+
+        int64_t item = 0;
 
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -4931,17 +5007,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (split_rows) {
-                int64_t n4, npad, nv;
-                expert_items(cne1, n4, npad, nv);
-                const int64_t w_expert = expert_weight(n4, npad, nv);
-                if (w_pos + w_expert <= w_lo) {
-                    // every item of this expert sits below our range
-                    w_pos += w_expert;
-                    continue;
-                }
-                if (w_pos >= w_hi) {
-                    // and every item from this expert on sits above it
+                if (claim_lo >= n_items) {
+                    // our window is past the end of the list, so nothing left here is ours
                     break;
+                }
+                const int64_t k = expert_items(cne1);
+                if (item + k <= claim_lo) {
+                    // every item of this expert sits below our window, and the window only
+                    // ever moves forward, so skip the whole expert without walking it
+                    item += k;
+                    continue;
                 }
             }
 
@@ -4979,8 +5054,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 // full groups of 4 rows through the gemm
                 for (; ir1 + 4 <= cne1; ir1 += 4) {
-                    const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
-                    w_pos += 4*W_GEMM_ROW;
+                    const bool mine = !split_rows || own(item);
+                    item++;
                     if (mine) {
                         run_group(ir1, 4);
                     }
@@ -4991,11 +5066,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 // against three padded ones is three quarters wasted gemm, and it is the
                 // batch-of-one case, which must not regress.
                 //
-                // It steps w_pos by a full 4-row gemm because that is the call it makes, and
-                // that is what expert_items and expert_weight above charge it.
+                // It is ONE item because it is one call, which is what expert_items above
+                // counts it as.
                 if (cne1 - ir1 >= 2) {
-                    const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
-                    w_pos += 4*W_GEMM_ROW;
+                    const bool mine = !split_rows || own(item);
+                    item++;
                     if (mine) {
                         run_group(ir1, cne1 - ir1);
                     }
@@ -5005,8 +5080,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             // whatever is left, one gemv each
             for (; ir1 < cne1; ir1++) {
-                const bool mine = !split_rows || (w_pos >= w_lo && w_pos < w_hi);
-                w_pos += W_GEMV_ROW;
+                const bool mine = !split_rows || own(item);
+                item++;
                 if (!mine) {
                     continue;
                 }
