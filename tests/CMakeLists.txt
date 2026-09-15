@@ -342,6 +342,11 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(test-mmid-src1-quant PRIVATE MMID_SRC1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/mmid-src1-maple-f32.bin")
     llama_build_and_test(test-mul-mat-f32-nc.cpp)
     llama_build_and_test(test-repack-q4_K-head.cpp)
+    llama_build_and_test(test-moe-tail-identity.cpp)
+    # needs the ggml-cpu internal header moe-tail.h to re-read the switches in process
+    target_include_directories(test-moe-tail-identity PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
     # this one calls the repacked q4_K gemm kernels directly, so it needs the ggml-cpu
     # internal headers (repack.h, traits.h, ggml-common.h)
     target_include_directories(test-repack-q4_K-head PRIVATE

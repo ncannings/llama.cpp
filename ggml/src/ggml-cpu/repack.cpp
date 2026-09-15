@@ -1,6 +1,7 @@
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
+#include "moe-tail.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-impl.h"
@@ -4581,10 +4582,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
-        // 4x chunks per thread
+        // chunks per thread (4 upstream; GGML_CPU_MM_CHUNKS retunes the granularity).
+        // This only changes how the work-stealing loop below cuts src0 into chunks;
+        // every chunk is still a whole set of output rows computed by one thread with
+        // the same dot products in the same order, so the result does not depend on it.
         const int64_t nr0 = ggml_nrows(op->src[0]);
 
-        int     nth_scaled  = nth * 4;
+        int     nth_scaled  = nth * ggml_tail_mm_chunks();
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
         int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
 
