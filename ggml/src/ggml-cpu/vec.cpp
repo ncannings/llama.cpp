@@ -136,6 +136,71 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
     *s = sumf;
 }
 
+void ggml_vec_dot_f32_nc(int n, int nc, float * GGML_RESTRICT s, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y) {
+    int c = 0;
+
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+    // Blocked form of ggml_vec_dot_f32 over GGML_VEC_DOT_F32_NC consecutive src0 rows.
+    //
+    // Identity: every output element keeps the accumulation order of ggml_vec_dot_f32
+    // exactly. Same GGML_F32_ARR accumulators, same GGML_F32_STEP blocks visited in the same
+    // order, same GGML_F32_VEC_FMA with the same operands, same GGML_F32_VEC_REDUCE tree and
+    // the same scalar leftover loop. Only the loop nest around them changes: the activation
+    // block ay[] is loaded once and reused by all NC columns, so the column count divides the
+    // activation loads and gives the core NC independent FMA chains instead of one.
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    for (; c + GGML_VEC_DOT_F32_NC <= nc; c += GGML_VEC_DOT_F32_NC) {
+        const float * xu[GGML_VEC_DOT_F32_NC];
+
+        GGML_F32_VEC sum[GGML_VEC_DOT_F32_NC][GGML_F32_ARR];
+
+        for (int u = 0; u < GGML_VEC_DOT_F32_NC; ++u) {
+            xu[u] = (const float *) ((const char *) x + (size_t) (c + u)*bx);
+            for (int j = 0; j < GGML_F32_ARR; ++j) {
+                sum[u][j] = GGML_F32_VEC_ZERO;
+            }
+        }
+
+        GGML_F32_VEC ax;
+        GGML_F32_VEC ay[GGML_F32_ARR];
+
+        for (int i = 0; i < np; i += GGML_F32_STEP) {
+            for (int j = 0; j < GGML_F32_ARR; ++j) {
+                ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
+            }
+
+            for (int u = 0; u < GGML_VEC_DOT_F32_NC; ++u) {
+                for (int j = 0; j < GGML_F32_ARR; ++j) {
+                    ax = GGML_F32_VEC_LOAD(xu[u] + i + j*GGML_F32_EPR);
+
+                    sum[u][j] = GGML_F32_VEC_FMA(sum[u][j], ax, ay[j]);
+                }
+            }
+        }
+
+        for (int u = 0; u < GGML_VEC_DOT_F32_NC; ++u) {
+            float sumf = 0.0f;
+
+            // reduce sum0..sum3 to sum0
+            GGML_F32_VEC_REDUCE(sumf, sum[u]);
+
+            // leftovers
+            for (int i = np; i < n; ++i) {
+                sumf += xu[u][i]*y[i];
+            }
+
+            s[c + u] = sumf;
+        }
+    }
+#endif
+
+    // columns the block does not cover, and every non-SIMD build, go one at a time
+    for (; c < nc; ++c) {
+        ggml_vec_dot_f32(n, &s[c], 0, (const float *) ((const char *) x + (size_t) c*bx), 0, y, 0, 1);
+    }
+}
+
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
     assert(nrc == 1);
     GGML_UNUSED(nrc);
