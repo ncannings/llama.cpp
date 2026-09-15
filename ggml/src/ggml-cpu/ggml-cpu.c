@@ -15,6 +15,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "moe-tail.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3072,6 +3073,237 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+// ---------------- moe-tail switches ----------------
+// Each of these is read once and then read-only. The getters are lazy so that a
+// caller that reaches ggml-cpu before ggml_cpu_init() still sees the env value,
+// and the lazy init is idempotent: every thread computes the same answer from
+// the same environment, so the race is benign.
+static int ggml_tail_f_rows_flatten = -1;
+static int ggml_tail_f_bcast_scalar = -1;
+static int ggml_tail_f_sumrows_par  = -1;
+static int ggml_tail_f_barrier_run  = -1;
+static int ggml_tail_f_mm_chunks    = -1;
+
+static int ggml_tail_env_off(const char * name) {
+    const char * e = getenv(name);
+    return (e != NULL && atoi(e) == 1) ? 0 : 1;
+}
+
+void ggml_tail_init(void) {
+    ggml_tail_f_rows_flatten = ggml_tail_env_off("GGML_CPU_NO_ROWS_FLATTEN");
+    ggml_tail_f_bcast_scalar = ggml_tail_env_off("GGML_CPU_NO_BCAST_SCALAR");
+    ggml_tail_f_sumrows_par  = ggml_tail_env_off("GGML_CPU_NO_SUMROWS_PAR");
+    ggml_tail_f_barrier_run  = ggml_tail_env_off("GGML_CPU_NO_BARRIER_RUN");
+    {
+        const char * e = getenv("GGML_CPU_MM_CHUNKS");
+        int v = e ? atoi(e) : 4;
+        if (v < 1)   v = 1;
+        if (v > 256) v = 256;
+        ggml_tail_f_mm_chunks = v;
+    }
+}
+
+bool ggml_tail_rows_flatten(void) { if (ggml_tail_f_rows_flatten < 0) ggml_tail_init(); return ggml_tail_f_rows_flatten != 0; }
+bool ggml_tail_bcast_scalar(void) { if (ggml_tail_f_bcast_scalar < 0) ggml_tail_init(); return ggml_tail_f_bcast_scalar != 0; }
+bool ggml_tail_sumrows_par (void) { if (ggml_tail_f_sumrows_par  < 0) ggml_tail_init(); return ggml_tail_f_sumrows_par  != 0; }
+bool ggml_tail_barrier_run (void) { if (ggml_tail_f_barrier_run  < 0) ggml_tail_init(); return ggml_tail_f_barrier_run  != 0; }
+int  ggml_tail_mm_chunks   (void) { if (ggml_tail_f_mm_chunks    < 0) ggml_tail_init(); return ggml_tail_f_mm_chunks;        }
+
+// ---------------- moe-tail: pool-wide barrier elision for row-local runs ----------------
+//
+// The graph loop takes one pool-wide barrier after every computed node. A barrier
+// is only needed when a node reads bytes that a DIFFERENT thread wrote in the node
+// before it. For a run of consecutive elementwise nodes that all partition the same
+// number of rows with the same ceil-div block split, and whose only in-run sources
+// are whole earlier in-run outputs of identical shape and stride, thread t reads in
+// node k+1 exactly the rows it wrote in node k, so the barrier between them orders
+// nothing and can be dropped.
+//
+// The predicate is a pure function of the graph, the tensor addresses and nth, so
+// every thread computes the same run boundaries without communicating. It is
+// deliberately narrow:
+//
+//   - every node in the run is ADD, SUB, MUL or DIV on f32. RMS_NORM is DELIBERATELY
+//     excluded even though its flattened partition matches, because the CPU backend
+//     fuses RMS_NORM with the MUL after it: the node that actually gets written is
+//     then the MUL's destination and the weight it reads is the MUL's source, neither
+//     of which appears in the RMS_NORM node this scan can see. Admitting it would mean
+//     duplicating the fusion predicate here to know which tensors are really touched.
+//     ADD, SUB, MUL and DIV never fuse, so the run is exactly what the scan inspects.
+//   - every destination in the run is contiguous f32 with the same ne and nb, so
+//     row r of one is row r of another at the same byte offset and therefore the
+//     same thread.
+//   - every source of every node in the run is either one of those destinations
+//     (same tensor, same shape) or a tensor whose byte span is disjoint from all of
+//     them, so nothing a thread reads can be being written by another thread.
+//   - disabled entirely when an abort callback is installed, because abort is polled
+//     per node by thread 0 alone and a run lets threads sit on different nodes.
+//
+// Disable with GGML_CPU_NO_BARRIER_RUN=1. No arithmetic changes in either setting.
+
+#define GGML_TAIL_RUN_MAX 32
+
+static bool ggml_tail_node_live(const struct ggml_tensor * n) {
+    return !ggml_op_is_empty(n->op) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
+static bool ggml_tail_elem_op(const struct ggml_tensor * n) {
+    switch (n->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_tail_disjoint(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (a->data == NULL || b->data == NULL) {
+        return false;
+    }
+    const char * alo = (const char *) a->data;
+    const char * ahi = alo + ggml_nbytes(a);
+    const char * blo = (const char *) b->data;
+    const char * bhi = blo + ggml_nbytes(b);
+    return ahi <= blo || bhi <= alo;
+}
+
+// dst-shape compatibility: same type, contiguous, identical ne and nb
+static bool ggml_tail_same_layout(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (a->type != b->type) return false;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) return false;
+    }
+    return true;
+}
+
+// Index one past the last node of the elision run that starts at node_n.
+// The barrier after node k may be skipped for node_n <= k < end-1.
+static int ggml_tail_run_end(const struct ggml_cgraph * cgraph, int node_n) {
+    const struct ggml_tensor * first = cgraph->nodes[node_n];
+
+    if (!ggml_tail_elem_op(first) || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
+        return node_n + 1;
+    }
+
+    // destinations written inside the run, and the sources it reads from outside it
+    const struct ggml_tensor * dsts[GGML_TAIL_RUN_MAX];
+    const struct ggml_tensor * srcs[GGML_TAIL_RUN_MAX*GGML_MAX_SRC];
+    int n_dst = 0;
+    int n_src = 0;
+
+    dsts[n_dst++] = first;
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (first->src[i] != NULL) {
+            srcs[n_src++] = first->src[i];
+        }
+    }
+
+    // `scan` walks forward, `run_end` is one past the last node ADMITTED to the run.
+    // They are different because views and NOPs are stepped over: the graph loop reaches
+    // them without taking a barrier, so the scan must look through them to find the next
+    // real node, but looking through them must NOT on its own extend the run. Returning
+    // the scan cursor instead of the admitted end was a live defect: a single-node run
+    // followed by views then a node of a different shape would have had its barrier
+    // skipped, and the node after the views would read rows another thread had not
+    // written yet. test-moe-tail-identity catches it at one token with two threads.
+    int scan    = node_n + 1;
+    int run_end = node_n + 1;
+
+    while (scan < cgraph->n_nodes && n_dst < GGML_TAIL_RUN_MAX) {
+        const struct ggml_tensor * c = cgraph->nodes[scan];
+
+        if (!ggml_tail_node_live(c)) {
+            scan++;
+            continue;
+        }
+
+        if (!ggml_tail_elem_op(c) ||
+            c->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(c) ||
+            !ggml_tail_same_layout(c, first)) {
+            break;
+        }
+
+        bool ok = true;
+
+        // 1. every source of c is either a destination the run already wrote, which has
+        //    the same layout and is therefore row-aligned with c, or a tensor the run
+        //    never writes.
+        for (int i = 0; i < GGML_MAX_SRC && ok; i++) {
+            const struct ggml_tensor * sc = c->src[i];
+            if (sc == NULL) {
+                continue;
+            }
+            bool is_run_dst = false;
+            for (int d = 0; d < n_dst; d++) {
+                if (sc == dsts[d]) { is_run_dst = true; break; }
+            }
+            if (is_run_dst) {
+                continue;
+            }
+            for (int d = 0; d < n_dst; d++) {
+                if (!ggml_tail_disjoint(sc, dsts[d])) { ok = false; break; }
+            }
+            // c must not write over a source it does not own: an in-place node whose
+            // source is the same tensor would have been caught as a run destination
+            if (ok && !ggml_tail_disjoint(sc, c)) {
+                ok = false;
+            }
+            if (!ok) {
+                break;
+            }
+        }
+
+        // 2. c's destination must not land on bytes an EARLIER node of the run still
+        //    reads. The graph allocator is free to hand c the buffer of a tensor whose
+        //    last use was that earlier node, and without the barrier a thread that has
+        //    moved on to c would overwrite it under a thread still inside that node.
+        for (int i = 0; i < n_src && ok; i++) {
+            bool is_run_dst = false;
+            for (int d = 0; d < n_dst; d++) {
+                if (srcs[i] == dsts[d]) { is_run_dst = true; break; }
+            }
+            if (is_run_dst) {
+                continue;
+            }
+            if (!ggml_tail_disjoint(srcs[i], c)) {
+                ok = false;
+            }
+        }
+
+        // 3. two destinations in the run are the same tensor, an exact alias of each
+        //    other, or disjoint. The exact-alias case is the common one: the graph
+        //    allocator writes an ADD chain in place, so node k+1's destination is node
+        //    k's buffer. Both have the layout of first, so the same base pointer means
+        //    row r is the same bytes in both and therefore the same thread. A PARTIAL
+        //    overlap would not have that property and ends the run.
+        for (int d = 0; d < n_dst && ok; d++) {
+            if (c == dsts[d] || c->data == dsts[d]->data) {
+                continue;
+            }
+            if (!ggml_tail_disjoint(c, dsts[d])) { ok = false; }
+        }
+
+        if (!ok) {
+            break;
+        }
+
+        dsts[n_dst++] = c;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (c->src[i] != NULL && n_src < (int)(sizeof(srcs)/sizeof(srcs[0]))) {
+                srcs[n_src++] = c->src[i];
+            }
+        }
+        scan++;
+        run_end = scan;
+    }
+
+    return run_end;
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -3138,6 +3370,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // moe-tail: barrier elision run. Pure function of the graph and nth, so every
+    // thread computes the same boundaries. Off when an abort callback is installed.
+    const bool tail_runs = ggml_tail_barrier_run() && cplan->abort_callback == NULL;
+    int tail_run_end = -1;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3150,8 +3387,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (tail_runs && node_n >= tail_run_end) {
+            tail_run_end = ggml_tail_run_end(cgraph, node_n);
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int tail_node_n0 = node_n;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3165,7 +3407,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (node_n + 1 < cgraph->n_nodes && !(n_fused == 0 && tail_node_n0 + 1 < tail_run_end)) {
             ggml_barrier(state->threadpool);
         }
     }
@@ -3940,6 +4182,8 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
+
+        ggml_tail_init();
 
         is_first_call = false;
     }

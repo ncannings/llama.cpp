@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "moe-tail.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -1463,7 +1464,9 @@ static void ggml_compute_forward_sum_rows_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
+    const bool par = ggml_tail_sumrows_par();
+
+    if (!par && params->ith != 0) {
         return;
     }
 
@@ -1477,16 +1480,25 @@ static void ggml_compute_forward_sum_rows_f32(
     GGML_ASSERT(ne2 == ne02);
     GGML_ASSERT(ne3 == ne03);
 
-    for (int64_t i3 = 0; i3 < ne03; i3++) {
-        for (int64_t i2 = 0; i2 < ne02; i2++) {
-            for (int64_t i1 = 0; i1 < ne01; i1++) {
-                float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
-                float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
-                float row_sum = 0;
-                ggml_vec_sum_f32(ne00, &row_sum, src_row);
-                dst_row[0] = row_sum;
-            }
-        }
+    // Each row is summed by ggml_vec_sum_f32 exactly as before, in the same order,
+    // by one thread. Only the assignment of rows to threads changes.
+    const int64_t nr  = ne01*ne02*ne03;
+    int64_t ir0 = 0, ir1 = nr;
+    if (par) {
+        const int64_t dr = (nr + params->nth - 1)/params->nth;
+        ir0 = dr*params->ith;
+        ir1 = MIN(ir0 + dr, nr);
+    }
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir/(ne02*ne01);
+        const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
+        const int64_t i1 = (ir - i3*ne02*ne01 - i2*ne01);
+        float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+        float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
+        float row_sum = 0;
+        ggml_vec_sum_f32(ne00, &row_sum, src_row);
+        dst_row[0] = row_sum;
     }
 }
 
@@ -3948,38 +3960,67 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    // One row is one thread's work and the sum of squares over that row keeps the
+    // order it always had. The only thing that changes below is WHICH thread takes
+    // which row, so the result is bit-identical to the per-plane partition.
+    auto rms_norm_row = [&](int64_t i01, int64_t i02, int64_t i03) {
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+        ggml_float sum = 0.0;
+        // worth switching to explicit SIMD?
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
+        }
 
-                const float mean  = sum/ne00;
-                const float scale = 1.0f/sqrtf(mean + eps);
+        const float mean  = sum/ne00;
+        const float scale = 1.0f/sqrtf(mean + eps);
 
-                // if you hit this, likely you got an inf somewhere earlier
-                assert(scale > 0.0f);
+        // if you hit this, likely you got an inf somewhere earlier
+        assert(scale > 0.0f);
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
-                    const int64_t i11 = i01 % ne11;
-                    const int64_t i12 = i02 % ne12;
-                    const int64_t i13 = i03 % ne13;
-                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+        if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+            const int64_t i11 = i01 % ne11;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i13 = i03 % ne13;
+            const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
-                    }
-                } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                y[i00] = x[i00] * scale * w[i00];
+            }
+        } else {
+            memcpy(y, x, ne00 * sizeof(float));
+            ggml_vec_scale_f32(ne00, y, scale);
+        }
+    };
+
+    if (ggml_tail_rows_flatten()) {
+        // Partition the FLATTENED row index with the same ceil-div block split that
+        // get_thread_range gives the elementwise ops. The old partition split ne01
+        // alone inside a loop over ne02, so it is only as good as ne01 divides nth.
+        // On the Maple graph the K norm is [128, 4, 64]: ne01 = 4, so at ten threads
+        // SIX OF TEN do nothing and the four that work take 64 rows each where 25.6
+        // is the share. The Q norm [128, 16, 64] splits 2/1, 128 rows against 102.4.
+        // Flattening makes both 1.02 and 1.01 of the share. Which thread computes a
+        // row is the only thing that changes; the row itself is untouched.
+        const int64_t nr  = ne01*ne02*ne03;
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+            rms_norm_row(i01, i02, i03);
+        }
+    } else {
+        // TODO: optimize
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                    rms_norm_row(i01, i02, i03);
                 }
             }
         }

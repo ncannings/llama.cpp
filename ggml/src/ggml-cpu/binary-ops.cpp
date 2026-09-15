@@ -1,4 +1,5 @@
 #include "binary-ops.h"
+#include "moe-tail.h"
 
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -60,6 +61,11 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
+    const bool bcast_scalar = ggml_tail_bcast_scalar();
+
+    constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
+    constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
+    constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
 #ifdef GGML_USE_ACCELERATE
     vDSP_fn_t vDSP_op = nullptr;
@@ -93,6 +99,20 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
+
+            // ne10 == 1 is a single scalar broadcast along the whole row. The general
+            // loop below then calls a one-element vector op ne00 times, which on the
+            // Maple ffn_moe_weighted MUL ([2048, 8, 64] scaled by [1, 8, 64]) is 2048
+            // calls per row. Hoisting the scalar and running one loop is the same
+            // expression on the same operands in the same order, element by element,
+            // so it is bit-identical and merely lets the compiler see the row.
+            if (ne10 == 1 && bcast_scalar) {
+                const float yv = src1_to_f32(*src1_ptr);
+                for (int64_t i = 0; i < ne00; ++i) {
+                    dst_ptr[i] = f32_to_dst(op(src0_to_f32(src0_ptr[i]), yv));
+                }
+                continue;
+            }
 
             for (int64_t r = 0; r < nr0; ++r) {
 #ifdef GGML_USE_ACCELERATE
