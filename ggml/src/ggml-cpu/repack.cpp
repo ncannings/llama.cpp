@@ -4389,10 +4389,16 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 // gemm2: a GEMM over exactly two activation rows. The i8mm kernel's natural activation
 // granularity is a row pair (one vmmlaq_s32 consumes 2 rows x 8 columns), so a pair of rows
 // can be served by one pass over the weights instead of two gemv passes. Only the TQ2_0 8x8
-// i8mm kernel has one. Everything else keeps has_gemm2 false and leaves 2-row groups on
-// gemv, in particular the TQ2_0 8x4 dotprod kernel, which this machine's build never
-// selects (i8mm is present) and where a 2-row variant could therefore not be held to the
-// bit-identity bar the rest of this work is held to.
+// i8mm kernel has one.
+//
+// NOT DISPATCHED. forward_mul_mat_id below pads a remainder of 2 or 3 rows to a full group
+// and sends it through the 4-row gemm instead. Measured on the ten big cores, dispatching
+// short groups to gemm2 was flat against sending them to gemv (140/281/360/420/489/556 t/s
+// at npl 1/4/8/16/32/64 against 142/282/360/408/484/575), which is inside the run to run
+// spread: gemm's per-row advantage comes from amortising one weight load over four
+// activation rows, and amortising over two recovers too little of it to show. The kernel and
+// its bit-exact record are kept on branch moe-gemm-v3 and stay compiled here so the
+// comparison can be re-run, but nothing calls them.
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 constexpr bool has_gemm2 = false;
 
@@ -4662,9 +4668,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     // The placement rule is read off ggml_quantize_mat_q8_K_4x4 and _4x8:
     // qs[c*4*BL + r*BL + t] = row r, element c*BL + t, and
     // bsums[(sb/4)*16 + r*4 + (sb%4)] = row r, sub block sb.
-    // nrows is 4 for the full gemm and 2 for gemm2. With nrows 2 the slots of rows 2 and 3
-    // are left untouched: gemm2 reads neither their quants, nor their scales, nor their
-    // block sums, so nothing has to be written there and nothing has to be zeroed.
+    // nrows is the number of real rows, 2, 3 or 4. The slots of rows nrows .. 3 are filled
+    // with zeros, which is exactly what ggml_quantize_mat_q8_K_4x4 and _4x8 produce from an
+    // all-zero source row: their amax is 0, so they take the "amax ? ... : 0" branch and
+    // yield d = 0, zero quants and zero block sums, with no division by zero. A padded row
+    // therefore contributes only to its own output row, which the caller discards.
     static void interleave_rows(const char * const rows[4], int64_t nrows, char * panel, int64_t n_per_row) {
         constexpr int64_t BL = INTER_SIZE; // blck_size_interleave
 
@@ -4682,6 +4690,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         y[b].bsums[(sb >> 2)*16 + r*4 + (sb & 3)] = x->bsums[sb];
                     }
                 }
+                for (int64_t r = nrows; r < 4; r++) {
+                    y[b].d[r] = 0.0f;
+                    for (int64_t c = 0; c < QK_K/BL; c++) {
+                        memset(y[b].qs + c*4*BL + r*BL, 0, BL);
+                    }
+                    for (int64_t sb = 0; sb < QK_K/16; sb++) {
+                        y[b].bsums[(sb >> 2)*16 + r*4 + (sb & 3)] = 0;
+                    }
+                }
             }
         } else {
             GGML_ABORT("no activation interleave for this parameter type");
@@ -4691,10 +4708,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     // MUL_MAT_ID over a repacked src0. Each activation row is quantised exactly once, as
     // before. The rows routed to one expert are then taken four at a time through the same
     // 4-row gemm that forward_mul_mat uses, with the panel assembled by permuting those four
-    // quantised rows in per-thread scratch. Where a 2-row gemm exists, one further pair is
-    // taken through it, so a group of 2 or 3 rows costs one pass over the expert weights
-    // rather than two or three. The 0 or 1 row left over goes through gemv, which is the
-    // original path unchanged. Nothing is padded and no extra barrier is needed.
+    // quantised rows in per-thread scratch. A remainder of 2 or 3 rows is zero padded to a
+    // full group and takes the same gemm, so it costs one pass over the expert weights
+    // rather than two or three; the padded output rows are discarded. A remainder of 1 row
+    // goes through gemv, the original path unchanged, so a batch of one cannot regress.
+    // There is no extra barrier.
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -4821,6 +4839,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 // gather the group's quantised rows, run one gemm over them and scatter the
                 // result: the dst rows of one expert are not contiguous, so the gemm writes
                 // a contiguous per-thread tile which is then copied out row by row
+                // gather the group's quantised rows, zero pad to four, run one gemm over
+                // them and scatter the result: the dst rows of one expert are not
+                // contiguous, so the gemm writes a contiguous per-thread tile which is then
+                // copied out row by row, padded rows excluded
                 auto run_group = [&](int64_t first, int64_t nrows) {
                     const char * rows[4];
                     for (int64_t ir = 0; ir < nrows; ++ir) {
@@ -4830,16 +4852,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     interleave_rows(rows, nrows, panel, ne10);
 
-                    if (nrows == 4) {
-                        gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                            ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 4, ncols);
-                    } else if constexpr (has_gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>) {
-                        // only reached for a type that has a 2-row gemm, and only with nrows 2
-                        gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                            ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 2, ncols);
-                    } else {
-                        GGML_ABORT("no 2-row gemm for this parameter type");
-                    }
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 4, ncols);
 
                     for (int64_t ir = 0; ir < nrows; ++ir) {
                         const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + ir);
@@ -4854,12 +4868,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     run_group(ir1, 4);
                 }
 
-                // then at most one pair of the 1 to 3 rows left over, through the 2-row gemm
-                if constexpr (has_gemm2<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>) {
-                    if (ir1 + 2 <= cne1) {
-                        run_group(ir1, 2);
-                        ir1 += 2;
-                    }
+                // a remainder of 2 or 3 rows, padded to a full group and through the same
+                // gemm. A remainder of 1 is left to gemv: one real row against three padded
+                // ones is three quarters wasted gemm, and it is the batch-of-one case, which
+                // must not regress.
+                if (cne1 - ir1 >= 2) {
+                    run_group(ir1, cne1 - ir1);
+                    ir1 = cne1;
                 }
             }
 

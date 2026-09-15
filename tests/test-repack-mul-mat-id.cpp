@@ -4,13 +4,14 @@
 // kernels are not bit-exact against the reference even for a single row on the untouched
 // gemv path, so it is checked against the usual 1e-3 relative tolerance instead.
 //
-// The repack path dispatches the rows routed to one expert as 4-row gemm calls, then one
-// 2-row gemm, then gemv for whatever is left, so the interesting variable is the number of
-// rows one expert receives modulo 4: rows 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12 and 17 are all
-// exercised, which covers every remainder 0, 1, 2, 3 both with and without a preceding
-// 4-row group. Three mixed routings additionally scatter the dst rows: 9/9/8/8, and two that
-// give an expert exactly 2 and exactly 3 rows. The results must be identical bit for bit,
-// not merely within tolerance.
+// The repack path dispatches the rows routed to one expert as 4-row gemm calls, then sends
+// a remainder of 2 or 3 rows through the same gemm zero padded to four, then gemv for a
+// remainder of 1, so the interesting variable is the number of rows one expert receives
+// modulo 4: rows 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12 and 17 are all exercised, which covers
+// every remainder 0, 1, 2, 3 both with and without a preceding 4-row group. Three mixed
+// routings additionally scatter the dst rows: 9/9/8/8, and two that give an expert exactly
+// 2 and exactly 3 rows. The results must be identical bit for bit, not merely within
+// tolerance: a padded row must not be able to move a real one.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
