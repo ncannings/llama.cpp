@@ -4514,29 +4514,341 @@ static inline void ggml_q4_K_8x8_superblock(const uint8_t * GGML_RESTRICT q4_qs,
           "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 }
 
-#endif  // GGML_Q4_K_8X8_GEMM_ASM
+// ---------------------------------------------------------------------------------------
+// q4_K 8x8 i8mm GEMM, EIGHT activation rows per pass.
+//
+// The 4-row kernel above re-reads a superblock's weight nibbles, scales and mins for four
+// rows of reuse: each unpacked weight vector feeds two SMMLA. Taking two q8_K 4-row panels
+// per pass makes it feed four. A full 8x8 tile would want 16 acc + 16 chain + 16 weight +
+// 16 activation vectors, four times the register file, so exactly one of weights or
+// activations has to be read twice per plane. A weight vector costs a load AND a mask, an
+// activation vector costs a load, so the activations are the ones re-read: the superblock
+// is walked twice, once per COLUMN HALF (column pairs 0,1 then 2,3), and inside a pass the
+// two row halves share one set of unpacked weights.
+//
+//   v0-v7   acc: (column pair a,b) x (row pair 0..3)   v24-v27  the four SMMLA chains
+//   v8-v15  activations, one row half                  v28      0x0f mask
+//   v16-v19 4-bit weights, column pair a               v30-v31  the two int32 scale vectors
+//   v20-v23 4-bit weights, column pair b               v29      free
+//
+// Per superblock that leaves the weight loads and masks where the 4-row kernel had them
+// (128 + 128) while doubling the SMMLA to 512, doubles the activation loads (128 to 256),
+// and halves the per-row cost of the two fixed items: the 512 byte scale table is built
+// once for eight rows instead of once for four, and the mins pass decodes each 6-bit min
+// set once and applies it to both panels. The column half is expressed by pre-offsetting
+// the pointers (weights +32 bytes, scale table +32 bytes, output +16 bytes), so one asm
+// body serves both passes.
+//
+// The mins pass keeps its sixteen accumulators in v16-v31 and the two bsums vectors in
+// v0-v1 because SMLAL/SMLAL2 by element require the indexed operand in V0-V15.
+//
+// Identity. Every chain starts at zero and takes k groups 0,1,2,3 in order; each acc takes
+// the low nibble plane of sub-block 2t scaled by that sub-block's scale before the high
+// nibble plane of sub-block 2t+1, for t = 0..3, which is the 4-row order and therefore the
+// intrinsics order. The mins pass accumulates sub-block A then sub-block B within each
+// group and the groups in order, the same widening and the same lane pattern. Rows are
+// independent in the float fold and each row's fold is the 4-row kernel's, unchanged, so
+// the result is bit identical per row and not merely close.
+// ---------------------------------------------------------------------------------------
 
-void ggml_gemm_q4_K_8x8_q8_K(int                        n,
-                             float * GGML_RESTRICT      s,
-                             size_t                     bs,
-                             const void * GGML_RESTRICT vx,
-                             const void * GGML_RESTRICT vy,
-                             int                        nr,
-                             int                        nc) {
-#if defined(GGML_Q4_K_8X8_GEMM_ASM)
+#define GGML_Q4K88R8_W(MN, ARG)                              \
+    "ldr   q16, [x9, #0]\n"                                  \
+    "ldr   q17, [x9, #64]\n"                                 \
+    "ldr   q18, [x9, #128]\n"                                \
+    "ldr   q19, [x9, #192]\n"                                \
+    "ldr   q20, [x9, #16]\n"                                 \
+    "ldr   q21, [x9, #80]\n"                                 \
+    "ldr   q22, [x9, #144]\n"                                \
+    "ldr   q23, [x9, #208]\n"                                \
+    MN "  v16.16b, v16.16b, " ARG "\n"                       \
+    MN "  v17.16b, v17.16b, " ARG "\n"                       \
+    MN "  v18.16b, v18.16b, " ARG "\n"                       \
+    MN "  v19.16b, v19.16b, " ARG "\n"                       \
+    MN "  v20.16b, v20.16b, " ARG "\n"                       \
+    MN "  v21.16b, v21.16b, " ARG "\n"                       \
+    MN "  v22.16b, v22.16b, " ARG "\n"                       \
+    MN "  v23.16b, v23.16b, " ARG "\n"
+
+#define GGML_Q4K88R8_SC(SCOFF)                               \
+    "ldr   q30, [x10, #(" SCOFF ")]\n"                       \
+    "ldr   q31, [x10, #(" SCOFF " + 16)]\n"
+
+#define GGML_Q4K88R8_Q8(REG, BASE)                           \
+    "ldr   q8,  [" REG ", #(" BASE ")]\n"                    \
+    "ldr   q9,  [" REG ", #(" BASE " + 32)]\n"               \
+    "ldr   q10, [" REG ", #(" BASE " + 64)]\n"               \
+    "ldr   q11, [" REG ", #(" BASE " + 96)]\n"               \
+    "ldr   q12, [" REG ", #(" BASE " + 16)]\n"               \
+    "ldr   q13, [" REG ", #(" BASE " + 48)]\n"               \
+    "ldr   q14, [" REG ", #(" BASE " + 80)]\n"               \
+    "ldr   q15, [" REG ", #(" BASE " + 112)]\n"
+
+#define GGML_Q4K88R8_CHAIN(A0, A1, B0, B1)                   \
+    "movi  v24.4s, #0\n"                                     \
+    "movi  v25.4s, #0\n"                                     \
+    "movi  v26.4s, #0\n"                                     \
+    "movi  v27.4s, #0\n"                                     \
+    "smmla v24.4s, v16.16b, v8.16b\n"                        \
+    "smmla v25.4s, v16.16b, v12.16b\n"                       \
+    "smmla v26.4s, v20.16b, v8.16b\n"                        \
+    "smmla v27.4s, v20.16b, v12.16b\n"                       \
+    "smmla v24.4s, v17.16b, v9.16b\n"                        \
+    "smmla v25.4s, v17.16b, v13.16b\n"                       \
+    "smmla v26.4s, v21.16b, v9.16b\n"                        \
+    "smmla v27.4s, v21.16b, v13.16b\n"                       \
+    "smmla v24.4s, v18.16b, v10.16b\n"                       \
+    "smmla v25.4s, v18.16b, v14.16b\n"                       \
+    "smmla v26.4s, v22.16b, v10.16b\n"                       \
+    "smmla v27.4s, v22.16b, v14.16b\n"                       \
+    "smmla v24.4s, v19.16b, v11.16b\n"                       \
+    "smmla v25.4s, v19.16b, v15.16b\n"                       \
+    "smmla v26.4s, v23.16b, v11.16b\n"                       \
+    "smmla v27.4s, v23.16b, v15.16b\n"                       \
+    "mla   " A0 ".4s, v24.4s, v30.4s\n"                      \
+    "mla   " A1 ".4s, v25.4s, v30.4s\n"                      \
+    "mla   " B0 ".4s, v26.4s, v31.4s\n"                      \
+    "mla   " B1 ".4s, v27.4s, v31.4s\n"
+
+#define GGML_Q4K88R8_PLANE(MN, ARG, SCOFF, Q8BASE)           \
+    GGML_Q4K88R8_W(MN, ARG)                                  \
+    GGML_Q4K88R8_SC(SCOFF)                                   \
+    GGML_Q4K88R8_Q8("x15", Q8BASE)                           \
+    GGML_Q4K88R8_CHAIN("v0", "v2", "v1", "v3")               \
+    GGML_Q4K88R8_Q8("x16", Q8BASE)                           \
+    GGML_Q4K88R8_CHAIN("v4", "v6", "v5", "v7")
+
+// acc v0,v1 = (cp a, cp b) x row pair 0 ... v6,v7 = row pair 3. SMMLA leaves
+// {c0r0,c0r1,c1r0,c1r1} in each, so UZP1 of a column pair is the even row of the pair and
+// UZP2 the odd row, four columns of it; rows are 32 bytes apart in the output block.
+#define GGML_Q4K88R8_EPI                                     \
+    "uzp1  v16.4s, v0.4s, v1.4s\n"                           \
+    "uzp2  v17.4s, v0.4s, v1.4s\n"                           \
+    "uzp1  v18.4s, v2.4s, v3.4s\n"                           \
+    "uzp2  v19.4s, v2.4s, v3.4s\n"                           \
+    "uzp1  v20.4s, v4.4s, v5.4s\n"                           \
+    "uzp2  v21.4s, v4.4s, v5.4s\n"                           \
+    "uzp1  v22.4s, v6.4s, v7.4s\n"                           \
+    "uzp2  v23.4s, v6.4s, v7.4s\n"                           \
+    "str   q16, [%[out], #0]\n"                              \
+    "str   q17, [%[out], #32]\n"                             \
+    "str   q18, [%[out], #64]\n"                             \
+    "str   q19, [%[out], #96]\n"                             \
+    "str   q20, [%[out], #128]\n"                            \
+    "str   q21, [%[out], #160]\n"                            \
+    "str   q22, [%[out], #192]\n"                            \
+    "str   q23, [%[out], #224]\n"
+
+// one column half of the quants pass: four columns x eight rows over all eight sub-blocks.
+// out points at the first int32 of those four columns in row 0 of the 8x8 output block.
+static inline void ggml_q4_K_8x8x8_quants(const uint8_t * GGML_RESTRICT q4_qs,
+                                          const int32_t * GGML_RESTRICT tbl,
+                                          const int8_t * GGML_RESTRICT  q8a,
+                                          const int8_t * GGML_RESTRICT  q8b,
+                                          int32_t * GGML_RESTRICT       out) {
+    __asm__ volatile(
+        "mov   x9,  %[q4]\n"
+        "mov   x10, %[tbl]\n"
+        "mov   x15, %[q8a]\n"
+        "mov   x16, %[q8b]\n"
+        "mov   x8,  #4\n"
+        "movi  v28.16b, #0x0f\n"
+        "movi  v0.4s, #0\n" "movi  v1.4s, #0\n" "movi  v2.4s, #0\n" "movi  v3.4s, #0\n"
+        "movi  v4.4s, #0\n" "movi  v5.4s, #0\n" "movi  v6.4s, #0\n" "movi  v7.4s, #0\n"
+        "1:\n"
+        GGML_Q4K88R8_PLANE("and ", "v28.16b", "0",  "0")
+        GGML_Q4K88R8_PLANE("ushr", "#4",      "64", "128")
+        "add   x9,  x9,  #256\n"
+        "add   x10, x10, #128\n"
+        "add   x15, x15, #256\n"
+        "add   x16, x16, #256\n"
+        "subs  x8,  x8,  #1\n"
+        "b.ne  1b\n"
+        GGML_Q4K88R8_EPI
+        :
+        : [q4] "r"(q4_qs), [tbl] "r"(tbl), [q8a] "r"(q8a), [q8b] "r"(q8b), [out] "r"(out)
+        : "memory", "cc", "x8", "x9", "x10", "x15", "x16",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+          "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+// decode_q_Kx8_6bit_scales, mins half only; same masks, same shifts, same vmovl_u8 widening
+#define GGML_Q4K88R8_MINDEC(DN, VN, SCOFF)                   \
+    "ldr   w11, [%[sc], #(" SCOFF " + 4)]\n"                 \
+    "ldr   w13, [%[sc], #(" SCOFF " + 8)]\n"                 \
+    "and   w12, w11, %w[km1]\n"                              \
+    "lsr   w14, w11, #6\n"                                   \
+    "and   w14, w14, %w[km3]\n"                              \
+    "lsr   w11, w13, #4\n"                                   \
+    "and   w11, w11, %w[km2]\n"                              \
+    "orr   w11, w11, w14, lsl #4\n"                          \
+    "orr   x12, x12, x11, lsl #32\n"                         \
+    "fmov  " DN ", x12\n"                                    \
+    "uxtl  " VN ".8h, " VN ".8b\n"
+
+#define GGML_Q4K88R8_MINROW(L, H, BS, I0, I1)                \
+    "smlal  " L ".4s, v2.4h, " BS ".h[" I0 "]\n"             \
+    "smlal  " L ".4s, v3.4h, " BS ".h[" I1 "]\n"             \
+    "smlal2 " H ".4s, v2.8h, " BS ".h[" I0 "]\n"             \
+    "smlal2 " H ".4s, v3.8h, " BS ".h[" I1 "]\n"
+
+#define GGML_Q4K88R8_MINS(BSOFF, SCOFF)                      \
+    "ldr   q4, [%[bsa], #(" BSOFF ")]\n"                     \
+    "ldr   q5, [%[bsa], #(" BSOFF " + 16)]\n"                \
+    "addp  v0.8h, v4.8h, v5.8h\n"                            \
+    "ldr   q4, [%[bsb], #(" BSOFF ")]\n"                     \
+    "ldr   q5, [%[bsb], #(" BSOFF " + 16)]\n"                \
+    "addp  v1.8h, v4.8h, v5.8h\n"                            \
+    GGML_Q4K88R8_MINDEC("d2", "v2", SCOFF)                   \
+    GGML_Q4K88R8_MINDEC("d3", "v3", SCOFF " + 12")           \
+    GGML_Q4K88R8_MINROW("v16", "v17", "v0", "0", "1")        \
+    GGML_Q4K88R8_MINROW("v18", "v19", "v0", "2", "3")        \
+    GGML_Q4K88R8_MINROW("v20", "v21", "v0", "4", "5")        \
+    GGML_Q4K88R8_MINROW("v22", "v23", "v0", "6", "7")        \
+    GGML_Q4K88R8_MINROW("v24", "v25", "v1", "0", "1")        \
+    GGML_Q4K88R8_MINROW("v26", "v27", "v1", "2", "3")        \
+    GGML_Q4K88R8_MINROW("v28", "v29", "v1", "4", "5")        \
+    GGML_Q4K88R8_MINROW("v30", "v31", "v1", "6", "7")
+
+// the mins pass for both panels at once; out points at the 64 int32 mins area
+static inline void ggml_q4_K_8x8x8_mins(const uint8_t * GGML_RESTRICT q4_sc,
+                                        const int16_t * GGML_RESTRICT bsa,
+                                        const int16_t * GGML_RESTRICT bsb,
+                                        int32_t * GGML_RESTRICT       out) {
+    __asm__ volatile(
+        "movi  v16.4s, #0\n" "movi  v17.4s, #0\n" "movi  v18.4s, #0\n" "movi  v19.4s, #0\n"
+        "movi  v20.4s, #0\n" "movi  v21.4s, #0\n" "movi  v22.4s, #0\n" "movi  v23.4s, #0\n"
+        "movi  v24.4s, #0\n" "movi  v25.4s, #0\n" "movi  v26.4s, #0\n" "movi  v27.4s, #0\n"
+        "movi  v28.4s, #0\n" "movi  v29.4s, #0\n" "movi  v30.4s, #0\n" "movi  v31.4s, #0\n"
+        GGML_Q4K88R8_MINS("0",  "0")
+        GGML_Q4K88R8_MINS("32", "24")
+        GGML_Q4K88R8_MINS("64", "48")
+        GGML_Q4K88R8_MINS("96", "72")
+        "stp   q16, q17, [%[out], #0]\n"
+        "stp   q18, q19, [%[out], #32]\n"
+        "stp   q20, q21, [%[out], #64]\n"
+        "stp   q22, q23, [%[out], #96]\n"
+        "stp   q24, q25, [%[out], #128]\n"
+        "stp   q26, q27, [%[out], #160]\n"
+        "stp   q28, q29, [%[out], #192]\n"
+        "stp   q30, q31, [%[out], #224]\n"
+        :
+        : [sc] "r"(q4_sc), [bsa] "r"(bsa), [bsb] "r"(bsb), [out] "r"(out),
+          [km1] "r"(0x3f3f3f3fu), [km2] "r"(0x0f0f0f0fu), [km3] "r"(0x03030303u)
+        : "memory", "cc", "x11", "x12", "x13", "x14",
+          "v0", "v1", "v2", "v3", "v4", "v5",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+// the 512 byte sub-block scale table, built once for eight rows
+static inline void ggml_q4_K_8x8x8_table(const uint8_t * GGML_RESTRICT q4_sc,
+                                         int32_t * GGML_RESTRICT       tbl) {
+    __asm__ volatile(
+        GGML_Q4K88_DECODE("0",  "0")
+        GGML_Q4K88_DECODE("12", "64")
+        GGML_Q4K88_DECODE("24", "128")
+        GGML_Q4K88_DECODE("36", "192")
+        GGML_Q4K88_DECODE("48", "256")
+        GGML_Q4K88_DECODE("60", "320")
+        GGML_Q4K88_DECODE("72", "384")
+        GGML_Q4K88_DECODE("84", "448")
+        :
+        : [sc] "r"(q4_sc), [tbl] "r"(tbl),
+          [km1] "r"(0x3f3f3f3fu), [km2] "r"(0x0f0f0f0fu), [km3] "r"(0x03030303u)
+        : "memory", "cc", "x11", "x12", "x13", "x14",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v31");
+}
+
+// panels [y0, y1) taken two at a time, eight rows per pass
+static void ggml_gemm_q4_K_8x8_q8_K_range8(int                        n,
+                                           float * GGML_RESTRICT      s,
+                                           size_t                     bs,
+                                           const void * GGML_RESTRICT vx,
+                                           const void * GGML_RESTRICT vy,
+                                           int                        y0,
+                                           int                        y1,
+                                           int                        nc) {
     constexpr int ncols_interleaved = 8;
     constexpr int q8_k_blocklen     = 4;
     const int     nb                = n / QK_K;
 
-    assert(n % QK_K == 0);
-    assert(nr % 4 == 0);
-    assert(nc % ncols_interleaved == 0);
+    float32x4_t         acc_f32[16];
+    alignas(16) int32_t accbuf[128];
+    alignas(16) int32_t sctbl[128];
+
+    for (int y = y0; y + 1 < y1; y += 2) {
+        const block_q8_Kx4 * GGML_RESTRICT q8a = (const block_q8_Kx4 *) vy + (y * nb);
+        const block_q8_Kx4 * GGML_RESTRICT q8b = (const block_q8_Kx4 *) vy + ((y + 1) * nb);
+
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_q4_Kx8 * GGML_RESTRICT q4_ptr = (const block_q4_Kx8 *) vx + (x * nb);
+
+            for (int i = 0; i < 16; i++) {
+                acc_f32[i] = vdupq_n_f32(0);
+            }
+
+            for (int b = 0; b < nb; b++) {
+                ggml_q4_K_8x8x8_table(q4_ptr[b].scales, sctbl);
+                ggml_q4_K_8x8x8_quants(q4_ptr[b].qs, sctbl, q8a[b].qs, q8b[b].qs, accbuf);
+                ggml_q4_K_8x8x8_quants(q4_ptr[b].qs + 32, sctbl + 8, q8a[b].qs, q8b[b].qs, accbuf + 4);
+                ggml_q4_K_8x8x8_mins(q4_ptr[b].scales, q8a[b].bsums, q8b[b].bsums, accbuf + 64);
+
+                const float32x4_t q4_dmin_0 = vcvt_f32_f16(vld1_f16((const __fp16 *) (q4_ptr[b].dmin + 0)));
+                const float32x4_t q4_dmin_1 = vcvt_f32_f16(vld1_f16((const __fp16 *) (q4_ptr[b].dmin + 4)));
+                const float32x4_t q4_d_0    = vcvt_f32_f16(vld1_f16((const __fp16 *) (q4_ptr[b].d + 0)));
+                const float32x4_t q4_d_1    = vcvt_f32_f16(vld1_f16((const __fp16 *) (q4_ptr[b].d + 4)));
+
+                for (int i = 0; i < 2 * q8_k_blocklen; i++) {
+                    const float32x4_t q8_d = vdupq_n_f32(i < q8_k_blocklen ? q8a[b].d[i] : q8b[b].d[i - q8_k_blocklen]);
+
+                    const float32x4_t dmins0 = vmulq_f32(q4_dmin_0, q8_d);
+                    const float32x4_t scale0 = vmulq_f32(q4_d_0, q8_d);
+                    acc_f32[2 * i] = vmlsq_f32(acc_f32[2 * i], vcvtq_f32_s32(vld1q_s32(accbuf + 64 + 8 * i)), dmins0);
+                    acc_f32[2 * i] = vmlaq_f32(acc_f32[2 * i], vcvtq_f32_s32(vld1q_s32(accbuf + 8 * i)), scale0);
+
+                    const float32x4_t dmins1 = vmulq_f32(q4_dmin_1, q8_d);
+                    const float32x4_t scale1 = vmulq_f32(q4_d_1, q8_d);
+                    acc_f32[2 * i + 1] = vmlsq_f32(acc_f32[2 * i + 1], vcvtq_f32_s32(vld1q_s32(accbuf + 64 + 8 * i + 4)), dmins1);
+                    acc_f32[2 * i + 1] = vmlaq_f32(acc_f32[2 * i + 1], vcvtq_f32_s32(vld1q_s32(accbuf + 8 * i + 4)), scale1);
+                }
+            }
+
+            for (int i = 0; i < 2 * q8_k_blocklen; i++) {
+                int row = y * q8_k_blocklen + i;
+                for (int j = 0; j < 2; j++) {
+                    int col    = x * ncols_interleaved + j * 4;
+                    int offset = row * bs + col;
+                    vst1q_f32(s + offset, acc_f32[2 * i + j]);
+                }
+            }
+        }  // for x
+    }  // for y
+}
+
+#endif  // GGML_Q4_K_8X8_GEMM_ASM
+
+#if defined(GGML_Q4_K_8X8_GEMM_ASM)
+
+// panels [y0, y1), four rows per pass. This is the kernel the 8-row tile was measured
+// against and the one a trailing odd panel still runs.
+static void ggml_gemm_q4_K_8x8_q8_K_range4(int                        n,
+                                           float * GGML_RESTRICT      s,
+                                           size_t                     bs,
+                                           const void * GGML_RESTRICT vx,
+                                           const void * GGML_RESTRICT vy,
+                                           int                        y0,
+                                           int                        y1,
+                                           int                        nc) {
+    constexpr int ncols_interleaved = 8;
+    constexpr int q8_k_blocklen     = 4;
+    const int     nb                = n / QK_K;
 
     float32x4_t         acc_f32[8];
     alignas(16) int32_t accbuf[64];
     alignas(16) int32_t sctbl[128];
 
-    for (int y = 0; y < nr / q8_k_blocklen; y++) {
+    for (int y = y0; y < y1; y++) {
         const block_q8_Kx4 * GGML_RESTRICT q8_ptr = (const block_q8_Kx4 *) vy + (y * nb);
 
         for (int x = 0; x < nc / ncols_interleaved; x++) {
@@ -4580,6 +4892,55 @@ void ggml_gemm_q4_K_8x8_q8_K(int                        n,
             }
         }  // for x
     }  // for y
+}
+
+#endif  // GGML_Q4_K_8X8_GEMM_ASM
+
+// The exported 4-row kernel. tests/test-repack-q4_K-head.cpp holds the dispatched entry
+// point to this as well as to the intrinsics kernel, so that the 8-row tile is checked
+// against the code it actually replaces and not only against the original reference.
+void ggml_gemm_q4_K_8x8_q8_K_asm4(int                        n,
+                                  float * GGML_RESTRICT      s,
+                                  size_t                     bs,
+                                  const void * GGML_RESTRICT vx,
+                                  const void * GGML_RESTRICT vy,
+                                  int                        nr,
+                                  int                        nc) {
+#if defined(GGML_Q4_K_8X8_GEMM_ASM)
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+    ggml_gemm_q4_K_8x8_q8_K_range4(n, s, bs, vx, vy, 0, nr / 4, nc);
+#else
+    ggml_gemm_q4_K_8x8_q8_K_intrinsics(n, s, bs, vx, vy, nr, nc);
+#endif  // GGML_Q4_K_8X8_GEMM_ASM
+}
+
+// The dispatched entry point. forward_mul_mat chunks src1 by whole planes, so nr is the
+// batch rounded down to a multiple of 4 and this sees eight rows exactly when ne11 >= 8.
+// Whole groups of eight go through the 8-row tile; a trailing odd panel keeps the 4-row
+// kernel, which is why the identity test covers every residue of 8 as well as of 4.
+void ggml_gemm_q4_K_8x8_q8_K(int                        n,
+                             float * GGML_RESTRICT      s,
+                             size_t                     bs,
+                             const void * GGML_RESTRICT vx,
+                             const void * GGML_RESTRICT vy,
+                             int                        nr,
+                             int                        nc) {
+#if defined(GGML_Q4_K_8X8_GEMM_ASM)
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 8 == 0);
+
+    const int npanel = nr / 4;
+    const int paired = (npanel / 2) * 2;
+
+    if (paired > 0) {
+        ggml_gemm_q4_K_8x8_q8_K_range8(n, s, bs, vx, vy, 0, paired, nc);
+    }
+    if (paired < npanel) {
+        ggml_gemm_q4_K_8x8_q8_K_range4(n, s, bs, vx, vy, paired, npanel, nc);
+    }
     return;
 #else
     ggml_gemm_q4_K_8x8_q8_K_intrinsics(n, s, bs, vx, vy, nr, nc);

@@ -7,9 +7,18 @@
 // step. Rounding differences against the scalar path are expected and are not the subject.
 //
 // Shape: a 2048 x 1024 Q4_K matrix, so 8 superblocks of K and 128 interleaved column
-// groups, at 1, 2, 3, 4, 5, 8 and 17 activation rows. The kernel handles four rows at a
-// time, so the row counts cover every residue of 4; forward_mul_mat rounds the row count up
-// to a multiple of 4 and the panel carries the padding, which is what the test reproduces.
+// groups, at 1, 2, 3, 4, 5, 8, 9, 12, 16, 17 and 64 activation rows. The kernel now handles
+// EIGHT rows at a time wherever two 4-row panels are available and four for a trailing odd
+// panel, so the row counts cover every residue of 4 below 8 (which stays on the 4-row path),
+// every residue of 8 above it, and 64 for the batch the Maple head actually sees;
+// forward_mul_mat rounds the row count up to a multiple of 4 and the panel carries the
+// padding, which is what the test reproduces.
+//
+// TWO references, and both must be exact. ggml_gemm_q4_K_8x8_q8_K_intrinsics is the original
+// claim, unchanged since the asm kernel went in. ggml_gemm_q4_K_8x8_q8_K_asm4 is the 4-row
+// asm kernel the 8-row tile was measured against and is the reference the 8-row work claims
+// against directly; it is the same code the dispatched entry point still runs for a trailing
+// odd panel, so a row count of 4 or 12 exercises it on both sides.
 //
 // Max diff must be exactly 0. A deliberate off-by-one anywhere in the kernel must make this
 // test fail; that sabotage check is recorded in docs/findings/2026-09-15-q4k-head-gemm.md.
@@ -45,7 +54,7 @@ int main(void) {
     const int nb = K / QK_K;      // 8 superblocks
     const int ng = NC / 8;        // 128 interleaved column groups
 
-    const int row_counts[] = { 1, 2, 3, 4, 5, 8, 17 };
+    const int row_counts[] = { 1, 2, 3, 4, 5, 8, 9, 12, 16, 17, 64 };
 
     std::mt19937 rng(20260915);
     std::uniform_int_distribution<int> byte_dist(0, 255);
@@ -116,13 +125,15 @@ int main(void) {
         }
 
         std::vector<float> out_ref((size_t) nr_pad * NC, 0.0f);
+        std::vector<float> out_a4((size_t) nr_pad * NC, 0.0f);
         std::vector<float> out_new((size_t) nr_pad * NC, 0.0f);
 
         ggml_gemm_q4_K_8x8_q8_K_intrinsics(K, out_ref.data(), NC, q4.data(), q8.data(), nr_pad, NC);
+        ggml_gemm_q4_K_8x8_q8_K_asm4(K, out_a4.data(), NC, q4.data(), q8.data(), nr_pad, NC);
         ggml_gemm_q4_K_8x8_q8_K(K, out_new.data(), NC, q4.data(), q8.data(), nr_pad, NC);
 
-        size_t differing = 0;
-        double maxdiff   = 0.0;
+        size_t differing = 0, differing_a4 = 0;
+        double maxdiff = 0.0, maxdiff_a4 = 0.0;
         for (int r = 0; r < nr_real; r++) {          // only the real rows are the claim
             for (int c = 0; c < NC; c++) {
                 const size_t idx = (size_t) r * NC + c;
@@ -133,22 +144,34 @@ int main(void) {
                 if (d > maxdiff) {
                     maxdiff = d;
                 }
+                if (memcmp(&out_a4[idx], &out_new[idx], sizeof(float)) != 0) {
+                    differing_a4++;
+                }
+                const double d4 = std::fabs((double) out_a4[idx] - (double) out_new[idx]);
+                if (d4 > maxdiff_a4) {
+                    maxdiff_a4 = d4;
+                }
             }
         }
         if (maxdiff > worst) {
             worst = maxdiff;
         }
-        bad_bits += differing;
+        if (maxdiff_a4 > worst) {
+            worst = maxdiff_a4;
+        }
+        bad_bits += differing + differing_a4;
 
-        printf("rows %2d (padded to %2d): max diff %.17g, differing floats %zu -> %s\n",
-               nr_real, nr_pad, maxdiff, differing,
-               (maxdiff == 0.0 && differing == 0) ? "IDENTICAL" : "DIFFER");
-        if (maxdiff != 0.0 || differing != 0) {
+        const bool ok = (maxdiff == 0.0 && differing == 0 && maxdiff_a4 == 0.0 && differing_a4 == 0);
+        printf("rows %2d (padded to %2d): vs intrinsics max diff %.17g, differing %zu | "
+               "vs 4-row asm max diff %.17g, differing %zu -> %s\n",
+               nr_real, nr_pad, maxdiff, differing, maxdiff_a4, differing_a4,
+               ok ? "IDENTICAL" : "DIFFER");
+        if (!ok) {
             fails++;
         }
     }
 
-    printf("\nq4_K 8x8 head gemm vs intrinsics kernel: %s (worst max diff %.17g, %zu differing floats)\n",
+    printf("\nq4_K 8x8 head gemm vs intrinsics and 4-row asm kernels: %s (worst max diff %.17g, %zu differing floats)\n",
            fails == 0 ? "PASS" : "FAIL", worst, bad_bits);
     return fails == 0 ? 0 : 1;
 }

@@ -178,6 +178,11 @@ void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 // Only defined by the arm arch file; see GGML_Q4_K_8X8_GEMM_ASM there.
 #if defined(__aarch64__) && defined(__ARM_NEON)
 void ggml_gemm_q4_K_8x8_q8_K_intrinsics(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+// The 4-row asm kernel, the immediate predecessor of the 8-row activation tile and the
+// kernel the dispatched entry point still runs for a trailing odd panel. Exported so the
+// identity test can hold the 8-row path to it directly. Falls through to the intrinsics
+// kernel wherever GGML_Q4_K_8X8_GEMM_ASM is off.
+void ggml_gemm_q4_K_8x8_q8_K_asm4(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #endif
 void ggml_gemm_q5_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q5_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
