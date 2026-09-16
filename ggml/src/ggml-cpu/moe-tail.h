@@ -26,6 +26,10 @@ bool ggml_tail_rows_flatten(void);
 bool ggml_tail_bcast_scalar(void);
 bool ggml_tail_sumrows_par(void);
 bool ggml_tail_barrier_run(void);
+
+// persistent-sched: per-node dependency tracking in place of the pool-wide
+// barrier. Disable with GGML_CPU_NO_PSCHED=1.
+bool ggml_psched_enabled(void);
 int  ggml_tail_mm_chunks(void);
 
 #ifdef __cplusplus

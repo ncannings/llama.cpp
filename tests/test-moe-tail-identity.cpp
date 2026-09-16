@@ -8,6 +8,8 @@
 //   GGML_CPU_NO_BCAST_SCALAR   a row broadcast by one scalar runs as one loop instead of
 //                              ne00 calls to a one-element vector op
 //   GGML_CPU_NO_SUMROWS_PAR    SUM_ROWS is split over rows instead of run on thread 0
+//   GGML_CPU_NO_PSCHED         the graph loop replaces the pool-wide per-node barrier
+//                              with per-node dependency tracking
 //   GGML_CPU_NO_BARRIER_RUN    a run of consecutive row-local elementwise nodes shares
 //                              one pool-wide barrier instead of taking one each
 //
@@ -306,6 +308,7 @@ struct switches {
     int no_bcast_scalar;
     int no_sumrows_par;
     int no_barrier_run;
+    int no_psched;
 };
 
 static void apply(const switches & s) {
@@ -313,6 +316,7 @@ static void apply(const switches & s) {
     setenv("GGML_CPU_NO_BCAST_SCALAR", s.no_bcast_scalar ? "1" : "0", 1);
     setenv("GGML_CPU_NO_SUMROWS_PAR",  s.no_sumrows_par  ? "1" : "0", 1);
     setenv("GGML_CPU_NO_BARRIER_RUN",  s.no_barrier_run  ? "1" : "0", 1);
+    setenv("GGML_CPU_NO_PSCHED",       s.no_psched       ? "1" : "0", 1);
     ggml_tail_init();
 }
 
@@ -333,12 +337,14 @@ int main(void) {
     }
 
     const switches cfgs[] = {
-        { "reference (all off, upstream behaviour)", 1, 1, 1, 1 },
-        { "rows_flatten only",                       0, 1, 1, 1 },
-        { "bcast_scalar only",                       1, 0, 1, 1 },
-        { "sumrows_par only",                        1, 1, 0, 1 },
-        { "barrier_run only",                        1, 1, 1, 0 },
-        { "all on (shipped default)",                0, 0, 0, 0 },
+        { "reference (all off, upstream behaviour)", 1, 1, 1, 1, 1 },
+        { "rows_flatten only",                       0, 1, 1, 1, 1 },
+        { "bcast_scalar only",                       1, 0, 1, 1, 1 },
+        { "sumrows_par only",                        1, 1, 0, 1, 1 },
+        { "barrier_run only",                        1, 1, 1, 0, 1 },
+        { "moe-tail four on",                        0, 0, 0, 0, 1 },
+        { "psched only",                             1, 1, 1, 1, 0 },
+        { "all on (shipped default)",                0, 0, 0, 0, 0 },
     };
 
     const int64_t toks[] = { 1, 4, 64, 129 };

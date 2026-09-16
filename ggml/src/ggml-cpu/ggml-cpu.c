@@ -493,6 +493,10 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
+    // persistent-sched: per-thread progress counter, one per cache line. prog[t] is the
+    // number of scheduler slots thread t has completed in the current graph.
+    struct { atomic_int GGML_CACHE_ALIGN v; } psched_prog[GGML_MAX_N_THREADS];
+
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
@@ -3083,6 +3087,7 @@ static int ggml_tail_f_rows_flatten = -1;
 static int ggml_tail_f_bcast_scalar = -1;
 static int ggml_tail_f_sumrows_par  = -1;
 static int ggml_tail_f_barrier_run  = -1;
+static int ggml_tail_f_psched      = -1;
 static int ggml_tail_f_mm_chunks    = -1;
 
 static int ggml_tail_env_off(const char * name) {
@@ -3095,6 +3100,7 @@ void ggml_tail_init(void) {
     ggml_tail_f_bcast_scalar = ggml_tail_env_off("GGML_CPU_NO_BCAST_SCALAR");
     ggml_tail_f_sumrows_par  = ggml_tail_env_off("GGML_CPU_NO_SUMROWS_PAR");
     ggml_tail_f_barrier_run  = ggml_tail_env_off("GGML_CPU_NO_BARRIER_RUN");
+    ggml_tail_f_psched       = ggml_tail_env_off("GGML_CPU_NO_PSCHED");
     {
         const char * e = getenv("GGML_CPU_MM_CHUNKS");
         int v = e ? atoi(e) : 4;
@@ -3120,6 +3126,7 @@ bool ggml_tail_rows_flatten(void) { if (ggml_tail_f_rows_flatten < 0) ggml_tail_
 bool ggml_tail_bcast_scalar(void) { if (ggml_tail_f_bcast_scalar < 0) ggml_tail_init(); return ggml_tail_f_bcast_scalar != 0; }
 bool ggml_tail_sumrows_par (void) { if (ggml_tail_f_sumrows_par  < 0) ggml_tail_init(); return ggml_tail_f_sumrows_par  != 0; }
 bool ggml_tail_barrier_run (void) { if (ggml_tail_f_barrier_run  < 0) ggml_tail_init(); return ggml_tail_f_barrier_run  != 0; }
+bool ggml_psched_enabled   (void) { if (ggml_tail_f_psched       < 0) ggml_tail_init(); return ggml_tail_f_psched       != 0; }
 int  ggml_tail_mm_chunks   (void) { if (ggml_tail_f_mm_chunks    < 0) ggml_tail_init(); return ggml_tail_f_mm_chunks;        }
 
 // ---------------- moe-tail: pool-wide barrier elision for row-local runs ----------------
@@ -3321,11 +3328,14 @@ static int ggml_tail_run_end(const struct ggml_cgraph * cgraph, int node_n) {
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
-static int ggml_cpu_try_fuse_ops(
+// The fusion PREDICATE, with no side effects: the number of EXTRA graph nodes the
+// fusion at node_n would consume, or 0 for no fusion. Split out of the executor below
+// so the persistent schedule can predict the node stream the graph loop will walk
+// without duplicating the conditions. Both callers go through this one function.
+static int ggml_cpu_fuse_len(
         const struct ggml_cgraph * cgraph,
-        const int node_n,
-        const struct ggml_compute_params * params,
-        const struct ggml_cplan * cplan) {
+        const struct ggml_cplan  * cplan,
+        const int node_n) {
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
         return 0;
@@ -3345,14 +3355,456 @@ static int ggml_cpu_try_fuse_ops(
                 mul_w->type         == GGML_TYPE_F32 &&
                 mul_w->ne[0]        == node->ne[0]   &&
                 mul_w->nb[0]        == sizeof(float)) {
-
-                ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
         }
     }
 
     return 0;
+}
+
+static int ggml_cpu_try_fuse_ops(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        const struct ggml_compute_params * params,
+        const struct ggml_cplan * cplan) {
+
+    const int nf = ggml_cpu_fuse_len(cgraph, cplan, node_n);
+
+    if (nf > 0) {
+        ggml_compute_forward_rms_norm_mul_fused(params, cgraph->nodes[node_n], cgraph->nodes[node_n + 1]);
+    }
+
+    return nf;
+}
+
+// ---------------------------------------------------------------------------
+// persistent-sched: a per-layer decode stage schedule.
+//
+// The graph loop takes ONE POOL-WIDE BARRIER after every computed node. That is a
+// rendezvous: every thread waits for the slowest, at every node, whether or not the
+// next node reads anything the slowest thread wrote. On a Maple decode step that is
+// about 1000 barriers, and the v6 big-core profile put thread 0's time inside them
+// at 19 percent of a 64-sequence step.
+//
+// This replaces the unconditional barrier with per-node dependency tracking.
+//
+//   - Every thread publishes a monotone progress counter: prog[t] = the number of
+//     scheduler SLOTS thread t has completed in this graph. Threads walk the slots
+//     of a graph in the same order, so prog[t] > g means thread t has finished its
+//     slice of every slot up to and including g.
+//   - Each slot carries ONE integer, wait[s]: the value every thread's counter must
+//     reach before this thread may start slot s. wait[s] == 0 means no wait at all.
+//     Because the walk is in order and prog is monotone, waiting for the LARGEST
+//     producer subsumes every smaller one, so one integer is the whole dependency
+//     set. The barrier-per-node baseline is exactly wait[s] = s.
+//   - The wait is DIRECTED, not a rendezvous. A thread that is ahead is not dragged
+//     back; a thread whose next slot depends on a slot everybody already passed does
+//     not stop at all. That is the only mechanism here: no arithmetic, no partition
+//     and no reduction order changes.
+//
+// Bit-identity is by construction. Every thread computes the same slice of the same
+// node with the same ith/nth it would have had under the barriers; the only thing
+// that changes is WHEN it is allowed to start. The planner's job is to prove that
+// "when" never lets a thread read bytes another thread has not finished writing, and
+// never lets a thread overwrite bytes another thread is still reading.
+//
+// The three hazard classes the planner checks between slots j < s (ggml_psched_indep):
+//
+//   RAW  s reads bytes j wrote.   Disjoint byte spans, or an exact row-aligned alias.
+//   WAR  s writes bytes j reads.  Same test, in the other direction. This is the one
+//        the graph allocator makes necessary: it is free to hand slot s the buffer of
+//        a tensor whose last use was slot j.
+//   WAW  s and j write the same bytes. Disjoint, or an exact row-aligned alias.
+//
+// "Row-aligned" means both slots partition the same number of rows with the same
+// ceil-div block split and write the same layout, so row r belongs to the same thread
+// in both and thread t only ever reads what thread t wrote. That is the condition the
+// moe-tail barrier_run change proved on the eight consecutive expert ADDs, and this
+// admits exactly the same op set for it.
+//
+// Plus one hazard that is not in the graph at all:
+//
+//   WBUF the shared cplan work buffer and the threadpool chunk counter. MUL_MAT
+//        quantises src1 into wdata at a fixed offset and every thread reads it for
+//        the whole node; MUL_MAT_ID keeps its chunk counters there; the per-thread
+//        scratch users (ROPE, SET_ROWS, SOFT_MAX, FLASH_ATTN_EXT, TOP_K) stride
+//        wdata by their OWN per-thread size, so two different such nodes running at
+//        once would overlap whenever their strides differ. So: two nodes that both
+//        touch the work buffer are NEVER independent. This is the 2026-09-14 item 5b
+//        lesson (BitNet PPL 51.4 -> 15600) written down as a rule rather than
+//        rediscovered: the shared chunk counter cannot be primed across a removed
+//        barrier, so no barrier between two work-buffer users is ever removed here.
+//        The matmul's internal barrier is not touched.
+//
+// Anything whose write set is not bounded by its dst, or whose read set is not
+// bounded by its srcs, is not analysed: it gets a full wait before it and everything
+// after it gets a full wait for it, which is exactly the barrier behaviour. So the
+// schedule can never be weaker than the barriers it replaces.
+//
+// Disable with GGML_CPU_NO_PSCHED=1. When it is on it supersedes barrier_run, which
+// it subsumes (an ADD chain is row-aligned at every step, so every intervening wait
+// collapses to the stage entry).
+// ---------------------------------------------------------------------------
+
+#define GGML_PSCHED_MAX_SLOTS 64
+
+struct ggml_psched_stage {
+    int n;
+    int gnode[GGML_PSCHED_MAX_SLOTS]; // graph node index executed at this slot
+    int fuse [GGML_PSCHED_MAX_SLOTS]; // extra graph nodes consumed by fusion here
+    int wait [GGML_PSCHED_MAX_SLOTS]; // progress value every thread must reach, 0 = none
+    int why  [GGML_PSCHED_MAX_SLOTS]; // diagnostic: what stopped the backward scan
+};
+
+// Does this op touch the shared cplan work buffer or the threadpool chunk counter?
+// Derived by reading every `params->wdata` and `current_chunk` use in the CPU backend.
+// Unknown ops answer true, which is the safe answer.
+static bool ggml_psched_wbuf(const struct ggml_tensor * n) {
+    switch (n->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            // add_q_f32 / add1_q_f32 stage a row through wdata when the destination is
+            // quantised; the f32 path does not touch it.
+            return !(n->type == GGML_TYPE_F32 &&
+                     (n->src[0] == NULL || n->src[0]->type == GGML_TYPE_F32) &&
+                     (n->src[1] == NULL || n->src[1]->type == GGML_TYPE_F32));
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GLU:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SCALE:
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Is this op's whole effect described by its dst and src byte spans?
+static bool ggml_psched_analysable(const struct ggml_tensor * n) {
+    switch (n->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GLU:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SCALE:
+        case GGML_OP_ROPE:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_CONT:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Ops that partition their destination rows with the ceil-div contiguous block split
+// (get_thread_range). Row r therefore belongs to the same thread in any two of them
+// that have the same row count. Deliberately the SAME set barrier_run admits: ADD,
+// SUB, MUL and DIV never fuse, and their row reference is src[0], whose shape the op
+// asserts equal to dst's.
+static bool ggml_psched_rowsplit(const struct ggml_tensor * n) {
+    switch (n->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            return n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && n->src[0] != NULL;
+        default:
+            return false;
+    }
+}
+
+struct ggml_psched_slot {
+    const struct ggml_tensor * dst;
+    const struct ggml_tensor * src[GGML_MAX_SRC];
+    int   nsrc;
+    bool  wbuf;
+    bool  rows;
+    int64_t nr;
+};
+
+// Two tensors are the same bytes laid out the same way.
+static bool ggml_psched_exact_alias(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    return a == b || (a->data != NULL && a->data == b->data && ggml_tail_same_layout(a, b));
+}
+
+// Why a slot could not be made independent of its predecessor. Diagnostic only.
+enum ggml_psched_why { PSCHED_WHY_NONE = 0, PSCHED_WHY_WBUF, PSCHED_WHY_RAW, PSCHED_WHY_WAR, PSCHED_WHY_WAW, PSCHED_WHY_OPAQUE };
+static const char * ggml_psched_why_name(int w) {
+    switch (w) {
+        case PSCHED_WHY_WBUF:   return "wbuf";
+        case PSCHED_WHY_RAW:    return "raw";
+        case PSCHED_WHY_WAR:    return "war";
+        case PSCHED_WHY_WAW:    return "waw";
+        case PSCHED_WHY_OPAQUE: return "opaque";
+        default:                return "-";
+    }
+}
+
+// May slot s start without waiting for every thread to finish slot j (j < s)?
+static bool ggml_psched_indep_why(const struct ggml_psched_slot * sl, int j, int s, int * why);
+static bool ggml_psched_indep(const struct ggml_psched_slot * sl, int j, int s) {
+    int why = 0;
+    return ggml_psched_indep_why(sl, j, s, &why);
+}
+
+static bool ggml_psched_indep_why(const struct ggml_psched_slot * sl, int j, int s, int * why) {
+    const struct ggml_psched_slot * pj = &sl[j];
+    const struct ggml_psched_slot * ps = &sl[s];
+
+    // WBUF: the shared work buffer and the chunk counter.
+    if (pj->wbuf && ps->wbuf) {
+        *why = PSCHED_WHY_WBUF;
+        return false;
+    }
+
+    // Row-aligned: same row count, same destination layout, both contiguous f32 and
+    // both split by the ceil-div block. Then row r is the same thread in both.
+    const bool aligned =
+        pj->rows && ps->rows &&
+        pj->nr == ps->nr &&
+        ggml_tail_same_layout(pj->dst, ps->dst);
+
+    // RAW: every source of s is disjoint from j's destination, or is that destination
+    // read row-aligned.
+    for (int i = 0; i < ps->nsrc; i++) {
+        const struct ggml_tensor * sc = ps->src[i];
+        if (ggml_psched_exact_alias(sc, pj->dst)) {
+            if (!aligned || !ggml_tail_same_layout(sc, ps->dst)) {
+                *why = PSCHED_WHY_RAW;
+                return false;
+            }
+            continue;
+        }
+        if (!ggml_tail_disjoint(sc, pj->dst)) {
+            *why = PSCHED_WHY_RAW;
+            return false;
+        }
+    }
+
+    // WAR: s's destination is disjoint from every source j reads, or is an exact
+    // row-aligned alias of it.
+    for (int i = 0; i < pj->nsrc; i++) {
+        const struct ggml_tensor * sc = pj->src[i];
+        if (ggml_psched_exact_alias(sc, ps->dst)) {
+            if (!aligned || !ggml_tail_same_layout(sc, pj->dst)) {
+                *why = PSCHED_WHY_WAR;
+                return false;
+            }
+            continue;
+        }
+        if (!ggml_tail_disjoint(sc, ps->dst)) {
+            *why = PSCHED_WHY_WAR;
+            return false;
+        }
+    }
+
+    // WAW: the two destinations are disjoint or an exact row-aligned alias.
+    if (ggml_psched_exact_alias(ps->dst, pj->dst)) {
+        if (!aligned) {
+            *why = PSCHED_WHY_WAW;
+            return false;
+        }
+    } else if (!ggml_tail_disjoint(ps->dst, pj->dst)) {
+        *why = PSCHED_WHY_WAW;
+        return false;
+    }
+
+    *why = PSCHED_WHY_NONE;
+    return true;
+}
+
+static void ggml_psched_add_src(struct ggml_psched_slot * p, const struct ggml_tensor * t) {
+    if (t == NULL || p->nsrc >= GGML_MAX_SRC) {
+        return;
+    }
+    p->src[p->nsrc++] = t;
+}
+
+// Build the stage that starts at graph node `node_n`. `gseq0` is the global progress
+// value of its first slot. A pure function of the graph, so every thread computes the
+// same stage without communicating.
+static void ggml_psched_plan(
+        const struct ggml_cgraph * cgraph,
+        const struct ggml_cplan  * cplan,
+        int node_n,
+        int gseq0,
+        struct ggml_psched_stage * st) {
+
+    struct ggml_psched_slot sl[GGML_PSCHED_MAX_SLOTS];
+
+    st->n = 0;
+
+    int g = node_n;
+    while (g < cgraph->n_nodes && st->n < GGML_PSCHED_MAX_SLOTS) {
+        struct ggml_tensor * node = cgraph->nodes[g];
+
+        if (!ggml_tail_node_live(node)) {
+            g++;
+            continue;
+        }
+
+        const int s = st->n;
+        const int nf = ggml_cpu_fuse_len(cgraph, cplan, g);
+
+        struct ggml_psched_slot * p = &sl[s];
+        p->nsrc = 0;
+        p->rows = false;
+        p->nr   = 0;
+
+        if (nf > 0) {
+            // RMS_NORM + MUL: the tensor actually written is the MUL's destination and
+            // the weight read is the MUL's source. Neither appears in the RMS_NORM node.
+            struct ggml_tensor * mul = cgraph->nodes[g + 1];
+            p->dst  = mul;
+            p->wbuf = ggml_psched_wbuf(node) || ggml_psched_wbuf(mul);
+            ggml_psched_add_src(p, node->src[0]);
+            ggml_psched_add_src(p, node->src[1]);
+            ggml_psched_add_src(p, mul->src[0] == node ? mul->src[1] : mul->src[0]);
+            if (!ggml_psched_analysable(node) || !ggml_psched_analysable(mul)) {
+                p->dst = NULL;
+            }
+        } else {
+            p->dst  = node;
+            p->wbuf = ggml_psched_wbuf(node);
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                ggml_psched_add_src(p, node->src[i]);
+            }
+            if (!ggml_psched_analysable(node)) {
+                p->dst = NULL;
+            }
+            if (ggml_psched_rowsplit(node)) {
+                p->rows = true;
+                p->nr   = ggml_nrows(node->src[0]);
+            }
+        }
+
+        st->gnode[s] = g;
+        st->fuse [s] = nf;
+
+        st->why[s] = PSCHED_WHY_NONE;
+
+        if (s == 0) {
+            // Stage entry drains everything before it, so the planner never has to
+            // reason across a stage boundary.
+            st->wait[s] = gseq0;
+        } else if (p->dst == NULL) {
+            // Not analysed: behave exactly like the barrier.
+            st->wait[s] = gseq0 + s;
+            st->why [s] = PSCHED_WHY_OPAQUE;
+        } else {
+            // Scan back and stop at the first slot this one is not independent of.
+            // Everything earlier is subsumed because prog is monotone per thread.
+            int w = 0;
+            for (int j = s - 1; j >= 0; j--) {
+                int why = PSCHED_WHY_OPAQUE;
+                if (sl[j].dst == NULL || !ggml_psched_indep_why(sl, j, s, &why)) {
+                    w = gseq0 + j + 1;
+                    st->why[s] = why;
+                    break;
+                }
+            }
+            st->wait[s] = w;
+        }
+
+        GGML_ASSERT(st->wait[s] <= gseq0 + s); // a slot never waits for itself
+
+        st->n++;
+        g += 1 + nf;
+    }
+
+    GGML_ASSERT(st->n > 0);
+}
+
+// GGML_PSCHED_STATS=1 accounts the plan, not the time: how many slots a graph has and
+// how many of them still take a wait that is the full barrier the loop would have taken
+// anyway. Thread 0 only, so it costs nothing on the other threads and nothing at all
+// when the variable is unset.
+static int      ggml_psched_f_stats = -1;
+static uint64_t ggml_psched_n_graph = 0;
+static uint64_t ggml_psched_n_slot  = 0;
+static uint64_t ggml_psched_n_full  = 0;  // wait == the immediately preceding slot
+static uint64_t ggml_psched_n_free  = 0;  // no wait at all
+static uint64_t ggml_psched_n_skip  = 0;  // waits for something earlier than the previous slot
+
+static void ggml_psched_stats_dump(void) {
+    fprintf(stderr,
+            "psched: graphs=%llu slots=%llu full=%llu skip=%llu free=%llu  (%.1f%% of slots keep a full barrier)\n",
+            (unsigned long long) ggml_psched_n_graph,
+            (unsigned long long) ggml_psched_n_slot,
+            (unsigned long long) ggml_psched_n_full,
+            (unsigned long long) ggml_psched_n_skip,
+            (unsigned long long) ggml_psched_n_free,
+            ggml_psched_n_slot ? 100.0*(double)ggml_psched_n_full/(double)ggml_psched_n_slot : 0.0);
+}
+
+// GGML_PSCHED_DUMP=<n>: print the plan of the first n slots of the first graph.
+static int ggml_psched_f_dump = -1;
+static void ggml_psched_dump(const struct ggml_cgraph * cgraph, const struct ggml_psched_stage * st, int gseq0) {
+    if (ggml_psched_f_dump < 0) {
+        const char * e = getenv("GGML_PSCHED_DUMP");
+        ggml_psched_f_dump = e ? atoi(e) : 0;
+    }
+    for (int s = 0; s < st->n && ggml_psched_f_dump > 0; s++, ggml_psched_f_dump--) {
+        const struct ggml_tensor * n = cgraph->nodes[st->gnode[s]];
+        fprintf(stderr, "psched %4d %-16s %-24s wait=%-6d %s%s\n",
+                gseq0 + s, ggml_op_name(n->op), n->name, st->wait[s],
+                st->wait[s] == gseq0 + s ? "FULL " : (st->wait[s] == 0 ? "FREE " : "SKIP "),
+                ggml_psched_why_name(st->why[s]));
+    }
+}
+
+static void ggml_psched_stats(const struct ggml_psched_stage * st, int gseq0) {
+    if (ggml_psched_f_stats < 0) {
+        const char * e = getenv("GGML_PSCHED_STATS");
+        ggml_psched_f_stats = (e != NULL && atoi(e) == 1) ? 1 : 0;
+        if (ggml_psched_f_stats) {
+            atexit(ggml_psched_stats_dump);
+        }
+    }
+    if (!ggml_psched_f_stats) {
+        return;
+    }
+    for (int s = 0; s < st->n; s++) {
+        ggml_psched_n_slot++;
+        if (st->wait[s] == gseq0 + s) {
+            ggml_psched_n_full++;
+        } else if (st->wait[s] == 0) {
+            ggml_psched_n_free++;
+        } else {
+            ggml_psched_n_skip++;
+        }
+    }
+}
+
+static inline void ggml_psched_publish(struct ggml_threadpool * tp, int ith, int v) {
+    atomic_store_explicit(&tp->psched_prog[ith].v, v, memory_order_release);
+}
+
+static inline void ggml_psched_wait(struct ggml_threadpool * tp, int w, int nth) {
+    if (w <= 0) {
+        return;
+    }
+    for (int u = 0; u < nth; u++) {
+        while (atomic_load_explicit(&tp->psched_prog[u].v, memory_order_acquire) < w) {
+            ggml_thread_cpu_relax();
+        }
+    }
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
@@ -3383,10 +3835,27 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // persistent-sched: per-node dependency tracking in place of the pool-wide barrier.
+    // Off at one thread (where every barrier is already a no-op) and off when an abort
+    // callback is installed, because abort is polled per node by thread 0 alone and a
+    // dependency schedule lets threads sit on different nodes. Supersedes barrier_run.
+    const bool psched = ggml_psched_enabled() && cplan->abort_callback == NULL && params.nth > 1;
+
     // moe-tail: barrier elision run. Pure function of the graph and nth, so every
     // thread computes the same boundaries. Off when an abort callback is installed.
-    const bool tail_runs = ggml_tail_barrier_run() && cplan->abort_callback == NULL;
+    const bool tail_runs = !psched && ggml_tail_barrier_run() && cplan->abort_callback == NULL;
     int tail_run_end = -1;
+
+    struct ggml_psched_stage st;
+    int psched_slot = 0;
+    int psched_seq  = 0;
+    st.n = 0;
+
+    if (psched) {
+        // Every counter is zero before anyone publishes.
+        ggml_psched_publish(tp, state->ith, 0);
+        ggml_barrier(state->threadpool);
+    }
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3404,6 +3873,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tail_run_end = ggml_tail_run_end(cgraph, node_n);
         }
 
+        if (psched) {
+            if (psched_slot >= st.n) {
+                ggml_psched_plan(cgraph, cplan, node_n, psched_seq, &st);
+                psched_slot = 0;
+                if (state->ith == 0) {
+                    if (node_n == 0) { ggml_psched_n_graph++; }
+                    ggml_psched_stats(&st, psched_seq);
+                    ggml_psched_dump(cgraph, &st, psched_seq);
+                }
+            }
+            GGML_ASSERT(st.gnode[psched_slot] == node_n);
+            ggml_psched_wait(tp, st.wait[psched_slot], params.nth);
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int tail_node_n0 = node_n;
@@ -3412,6 +3895,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (psched) {
+            GGML_ASSERT(st.fuse[psched_slot] == n_fused);
+            psched_seq++;
+            psched_slot++;
+            ggml_psched_publish(tp, state->ith, psched_seq);
+            continue;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
