@@ -18,11 +18,15 @@
 //
 //   GGML_CPU_NO_MM_PARQUANT=1    restore the serial src1 quantisation at ne11 == 1
 //   GGML_CPU_NO_MM_STATIC1=1     restore the work-stealing chunk loop at ne11 == 1
+//   GGML_CPU_MM_STATIC_MAX_MB=<n> the static split applies only while the graph's whole
+//                                repacked weight working set is <= n MB (default 16;
+//                                0 removes the threshold entirely)
 //   GGML_CPU_NO_MM_DISPATCH=1    restore the std::vector walk in the extra-buffer dispatch
 //   GGML_CPU_WBUF_SLOTS=<n>      work-buffer regions in the cplan (1 = the single shared
 //                                buffer, the upstream behaviour; default 1)
 
 #include <stdbool.h>
+#include <stddef.h>
 
 // Maximum number of work-buffer regions a cplan may carry (GGML_CPU_WBUF_SLOTS).
 #define GGML_WBUF_SLOTS_MAX 8
@@ -47,6 +51,7 @@ int  ggml_tail_mm_chunks(void);
 // where a scratch byte lives, never an arithmetic result.
 bool ggml_mm_parquant(void);
 bool ggml_mm_static1(void);
+size_t ggml_mm_static_max_bytes(void);
 bool ggml_mm_dispatch(void);
 int  ggml_wbuf_slots(void);
 

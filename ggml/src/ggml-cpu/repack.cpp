@@ -4643,8 +4643,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         //
         // It also takes this node OFF the shared chunk counter entirely, which is what lets the
         // work-buffer regions of change 4 make two decode matmuls independent.
-        const bool mm_static1 = ggml_mm_static1() && ne11 == 1 && ne12 == 1 && ne02 == 1 &&
-                                nr0_static == ne01 && ne01 >= NB_COLS;
+        // RESIDENCY GATE, added after job 103 measured the ungated form. The static split
+        // removes the work-stealing counter, and the counter is what lets a fast thread take
+        // a second chunk while a slow one is still on its first. On the GB10 the ten big
+        // cores are NOT equal (the bimodal finding: they sit in two L3 domains and run at
+        // different speeds), so with the counter gone a streamed matmul finishes when the
+        // slowest five finish. Measured on ten big cores: resident synth-L1 and synth-L2
+        // gain 15 and 19 percent, streamed BitNet tg128 loses 4 percent and Maple npl 1
+        // loses 15 percent.
+        //
+        // The quantity that separates those two groups is the graph's WHOLE weight working
+        // set, not the size of this matmul: the largest single weight is 1.7 MB on the
+        // synthetic models and 4.4 MB on BitNet, so every model on the bench is far under any
+        // per-matrix threshold and a per-matrix test would change nothing. The working sets
+        // are 7.9 MB (synth-L1), 14.1 MB (synth-L2), 100.7 MB (synth-L16), 512 MB (BitNet)
+        // and gigabytes (Maple), which 16 MB cuts exactly where the measurement does.
+        const bool mm_resident = params->mm_weight_bytes > 0 &&
+                                 params->mm_weight_bytes <= ggml_mm_static_max_bytes();
+
+        const bool mm_static1 = ggml_mm_static1() && mm_resident && ne11 == 1 && ne12 == 1 &&
+                                ne02 == 1 && nr0_static == ne01 && ne01 >= NB_COLS;
 
         if (mm_static1) {
             int64_t src0_start = ((int64_t) ith       * ne01) / nth;

@@ -2858,6 +2858,7 @@ struct ggml_cplan ggml_graph_plan(
 #endif
 
     size_t work_size = 0;
+    size_t mm_weight_bytes = 0;
 
     struct ggml_cplan cplan;
     memset(&cplan, 0, sizeof(struct ggml_cplan));
@@ -2871,6 +2872,14 @@ struct ggml_cplan ggml_graph_plan(
         const int n_tasks = ggml_get_n_tasks(node, n_threads);
 
         max_tasks = MAX(max_tasks, n_tasks);
+
+        // mm-invoke: the decode step's weight working set. Summed over every matmul weight
+        // the graph reads, which is what decides whether the weights are cache-resident;
+        // the size of any ONE matmul does not (the largest single weight is 1.7 MB on the
+        // synthetic models and 4.4 MB on BitNet, so a per-matrix test separates nothing).
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            mm_weight_bytes += ggml_nbytes(node->src[0]);
+        }
 
         size_t cur = 0;
 
@@ -3109,6 +3118,26 @@ struct ggml_cplan ggml_graph_plan(
     cplan.work_data  = NULL;
     cplan.work_region = wregion;
     cplan.work_slots  = (wregion > 0) ? wslots : 1;
+    cplan.mm_weight_bytes = mm_weight_bytes;
+
+    // GGML_CPU_MM_STATS=1 prints the residency decision, once per distinct working set, so
+    // that a gate can ASSERT the routing rather than infer it from a timing. Thread 0 only
+    // (ggml_graph_plan runs before the pool), and free when the variable is unset.
+    {
+        static int    mm_stats_f    = -1;
+        static size_t mm_stats_last = 0;
+        if (mm_stats_f < 0) {
+            const char * e = getenv("GGML_CPU_MM_STATS");
+            mm_stats_f = (e != NULL && atoi(e) == 1) ? 1 : 0;
+        }
+        if (mm_stats_f && mm_weight_bytes != mm_stats_last) {
+            mm_stats_last = mm_weight_bytes;
+            fprintf(stderr, "mm: weight_working_set=%.2f MB threshold=%.2f MB static1_resident=%s\n",
+                    mm_weight_bytes / 1048576.0,
+                    ggml_mm_static_max_bytes() == (size_t) -1 ? -1.0 : ggml_mm_static_max_bytes() / 1048576.0,
+                    (mm_weight_bytes > 0 && mm_weight_bytes <= ggml_mm_static_max_bytes()) ? "yes" : "no");
+        }
+    }
 
     return cplan;
 }
@@ -3129,6 +3158,7 @@ static int ggml_mm_f_parquant       = -1;
 static int ggml_mm_f_static1        = -1;
 static int ggml_mm_f_dispatch       = -1;
 static int ggml_mm_f_wbuf_slots     = -1;
+static long ggml_mm_f_static_max_mb = -1;
 
 static int ggml_tail_env_off(const char * name) {
     const char * e = getenv(name);
@@ -3151,6 +3181,12 @@ void ggml_tail_init(void) {
     ggml_mm_f_parquant = ggml_tail_env_off("GGML_CPU_NO_MM_PARQUANT");
     ggml_mm_f_static1  = ggml_tail_env_off("GGML_CPU_NO_MM_STATIC1");
     ggml_mm_f_dispatch = ggml_tail_env_off("GGML_CPU_NO_MM_DISPATCH");
+    {
+        const char * e = getenv("GGML_CPU_MM_STATIC_MAX_MB");
+        long v = e ? atol(e) : 16;
+        if (v < 0) v = 16;
+        ggml_mm_f_static_max_mb = v;
+    }
     {
         const char * e = getenv("GGML_CPU_WBUF_SLOTS");
         int v = e ? atoi(e) : 1;
@@ -3182,6 +3218,10 @@ bool ggml_mm_parquant      (void) { if (ggml_mm_f_parquant       < 0) ggml_tail_
 bool ggml_mm_static1       (void) { if (ggml_mm_f_static1        < 0) ggml_tail_init(); return ggml_mm_f_static1        != 0; }
 bool ggml_mm_dispatch      (void) { if (ggml_mm_f_dispatch       < 0) ggml_tail_init(); return ggml_mm_f_dispatch       != 0; }
 int  ggml_wbuf_slots       (void) { if (ggml_mm_f_wbuf_slots     < 0) ggml_tail_init(); return ggml_mm_f_wbuf_slots;          }
+size_t ggml_mm_static_max_bytes(void) {
+    if (ggml_mm_f_static_max_mb < 0) ggml_tail_init();
+    return ggml_mm_f_static_max_mb == 0 ? (size_t) -1 : (size_t) ggml_mm_f_static_max_mb * 1024 * 1024;
+}
 
 // ---------------- moe-tail: pool-wide barrier elision for row-local runs ----------------
 //
@@ -3896,6 +3936,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
         /*.wslot      =*/ 0,
+        /*.mm_weight_bytes =*/ cplan->mm_weight_bytes,
     };
 
     // mm-invoke: work-buffer regions. A node's region is a pure function of its index, so

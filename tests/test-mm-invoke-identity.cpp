@@ -101,6 +101,7 @@ struct switches {
     int no_static1;
     int no_dispatch;
     int slots;
+    int static_max_mb;   // 0 = no threshold, the ungated form
 };
 
 static void apply(const switches & s) {
@@ -110,6 +111,8 @@ static void apply(const switches & s) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", s.slots);
     setenv("GGML_CPU_WBUF_SLOTS", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", s.static_max_mb);
+    setenv("GGML_CPU_MM_STATIC_MAX_MB", buf, 1);
     ggml_tail_init();
 }
 
@@ -254,14 +257,21 @@ int main(void) {
         return 1;
     }
 
+    // The weight working set of this test's ten shapes is about 9.8 MB, so the 16 MB
+    // residency threshold ADMITS the static split here and "static1 only" exercises it. The
+    // two extra rows walk the threshold off its default in both directions: at 1 MB the gate
+    // refuses and the chunk path runs, at 0 the threshold is removed entirely. Both must be
+    // identical to the reference, because both sides of the gate are the same arithmetic.
     const switches cfgs[] = {
-        { "reference (all off, upstream behaviour)", 1, 1, 1, 1 },
-        { "parquant only",                           0, 1, 1, 1 },
-        { "static1 only",                            1, 0, 1, 1 },
-        { "dispatch only",                           1, 1, 0, 1 },
-        { "wbuf_slots=3 only",                       1, 1, 1, 3 },
-        { "wbuf_slots=2 only",                       1, 1, 1, 2 },
-        { "all on (shipped default)",                0, 0, 0, 3 },
+        { "reference (all off, upstream behaviour)", 1, 1, 1, 1, 16 },
+        { "parquant only",                           0, 1, 1, 1, 16 },
+        { "static1 only",                            1, 0, 1, 1, 16 },
+        { "static1, threshold 1 MB (gate refuses)",  1, 0, 1, 1,  1 },
+        { "static1, threshold removed",              1, 0, 1, 1,  0 },
+        { "dispatch only",                           1, 1, 0, 1, 16 },
+        { "wbuf_slots=3 only",                       1, 1, 1, 3, 16 },
+        { "wbuf_slots=2 only",                       1, 1, 1, 2, 16 },
+        { "all on (shipped default)",                0, 0, 0, 3, 16 },
     };
 
     const int64_t toks[] = { 1, 2, 3, 4, 5, 64, 129 };

@@ -31,6 +31,9 @@ struct ggml_compute_params {
     // mm-invoke: which work-buffer region this node was given, and therefore which of the
     // threadpool's chunk counters it may use. Always 0 when work-buffer regions are off.
     int wslot;
+
+    // mm-invoke: the graph's whole MUL_MAT and MUL_MAT_ID weight working set, from the cplan.
+    size_t mm_weight_bytes;
 };
 
 

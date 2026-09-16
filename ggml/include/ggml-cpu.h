@@ -29,6 +29,11 @@ extern "C" {
         // Zero and one are the upstream behaviour: one region, shared.
         size_t work_region;
         int    work_slots;
+
+        // mm-invoke: the total bytes of every MUL_MAT and MUL_MAT_ID weight this graph
+        // reads, which is the decode step's weight working set. The static single-row split
+        // is taken only while this fits the cache (GGML_CPU_MM_STATIC_MAX_MB).
+        size_t mm_weight_bytes;
     };
 
     // numa strategies
