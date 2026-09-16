@@ -20,8 +20,14 @@
 #       "no WBUF refusal" means. That equality is the gate on the region change: it says
 #       the implementation reaches the bound the sabotage measured and does not exceed it.
 #   p2  the WAR refusal is deleted (the psched s4 shape), unchanged in effect
-#   p3  the planner's region mapping is shifted by one against the compute loop's, which is
-#       a schedule that permits an overlap the buffer does not allow
+#   p3  the PLANNER believes there are twice as many regions as the compute loop cuts, so it
+#       permits an overlap between two nodes that in fact share a region. A planner that is
+#       MORE conservative than the loop is safe; this is the direction that is not.
+#
+# An earlier p3 shifted the planner's node index by one against the loop's. It is recorded
+# here rather than quietly dropped: it changed NOTHING, in the plan or in behaviour, because
+# the refusal tests whether two nodes have the SAME region and shifting every node by the
+# same amount preserves every equality. A sabotage that cannot fail is not a gate.
 set -u
 T=/home/ncannings/ternary_bench/llama.cpp-mminv
 F=$T/ggml/src/ggml-cpu/ggml-cpu.c
@@ -42,7 +48,7 @@ for S in 1 2 3 4; do
   echo "   slots=$S maple  $(plan $M  $S)"
 done
 
-for tag in p1_no_wbuf p2_no_war p3_planner_shift; do
+for tag in p1_no_wbuf p2_no_war p3_planner_wider; do
     git checkout -- $F
     python3 - "$tag" <<'PY'
 import sys, pathlib
@@ -64,8 +70,8 @@ M = {
             *why = PSCHED_WHY_WAR;
             return false;
         }"""),
- "p3_planner_shift": ("""        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);""",
-                      """        p->wslot = ggml_psched_wslot(g + 1, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);"""),
+ "p3_planner_wider": ("""        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);""",
+                      """        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? 2*cplan->work_slots : 1);"""),
 }
 a, b = M[tag]
 assert s.count(a) == 1, (tag, s.count(a))

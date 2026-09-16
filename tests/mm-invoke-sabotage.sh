@@ -12,9 +12,15 @@
 #       a repacked group
 #   m3  the static row split leaves a hole: the last thread's range stops one group short
 #   m4  the dispatch shortcut visits the extra buffer types in reverse order
-#   m5  the work-buffer region mapping in the COMPUTE LOOP and the one in the PLANNER
-#       disagree, which is the shape that makes the schedule permit an overlap the buffer
-#       does not allow
+#   m5  the PLANNER believes there are twice as many work-buffer regions as the compute
+#       loop actually cuts, so it permits an overlap between two nodes that in fact share a
+#       region. This is the direction that matters: a planner that is MORE conservative than
+#       the loop is safe, a planner that is LESS conservative is the 5b shape.
+#
+# An earlier m5 shifted the planner's node index by one. That is a NO-OP and is recorded
+# here rather than quietly dropped: the refusal tests whether two nodes have the SAME
+# region, and shifting every node by the same amount preserves every equality, so the plan
+# is identical and so is the behaviour. It was replaced by the sabotage above.
 #
 # m1 to m3 must be caught by test-mm-invoke-identity. m4 is a no-op on a build with one
 # extra buffer type and is expected NOT to be caught: it is included so that the gate's
@@ -39,7 +45,7 @@ echo "== reference"
 build || { echo "reference build failed"; exit 3; }
 unit
 
-for tag in m1_block_round m2_no_align m3_row_hole m4_reverse_dispatch m5_planner_mismatch; do
+for tag in m1_block_round m2_no_align m3_row_hole m4_reverse_dispatch m5_planner_wider; do
     git checkout -- $R $C $TR
     python3 - "$tag" <<'PY'
 import sys, pathlib
@@ -64,9 +70,9 @@ M = {
  "m4_reverse_dispatch": ("traits.cpp",
    """        for (int i = 0; i < g_extra_n; i++) {""",
    """        for (int i = g_extra_n - 1; i >= 0; i--) {"""),
- "m5_planner_mismatch": ("ggml-cpu.c",
+ "m5_planner_wider": ("ggml-cpu.c",
    """        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);""",
-   """        p->wslot = ggml_psched_wslot(g + 1, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);"""),
+   """        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? 2*cplan->work_slots : 1);"""),
 }
 f, a, b = M[tag]
 p = T / f

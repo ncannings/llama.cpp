@@ -206,6 +206,16 @@ static bool run_graph(const weights & W,
         ggml_backend_tensor_set(a[i], f.data(), 0, f.size() * sizeof(float));
     }
 
+    // POISON every destination before the run. Without this a sabotage that leaves output
+    // rows UNWRITTEN can pass: the reference run frees its buffer and the treatment run is
+    // handed the same allocation back, so the unwritten rows still hold the reference's own
+    // bytes and compare equal. The m3 row-hole sabotage did exactly that before this was
+    // added, which is the reason it is here.
+    for (int i = 0; i < n_shape; i++) {
+        std::vector<uint8_t> poison(ggml_nbytes(res[i]), 0xA5);
+        ggml_backend_tensor_set(res[i], poison.data(), 0, poison.size());
+    }
+
     ggml_backend_cpu_set_n_threads(backend, nth);
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_backend_buffer_free(buf);
