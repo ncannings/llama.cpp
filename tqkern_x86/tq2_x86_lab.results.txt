@@ -1,0 +1,41 @@
+Warning: Permanently added '104.211.62.77' (ED25519) to the list of known hosts.
+=== RUN 2, random weights ===
+matrix 2048 x 1024 TQ2_0  codes+scales 0.541 MB  (2097152 weights)
+build: AVX2=1 AVX512F=1 AVX512VL=1 AVX512VNNI=1 AVX512BW=1
+shipped AVX2 vec_dot vs scalar ref maxrel 1.68e-04
+(a) vec_dot AVX2 (shipped)            28.224 us  0.0135 ns/weight     74.3 G weights/s  baseline
+(c) load only (mem floor)              4.849 us  0.0023 ns/weight    432.5 G weights/s  -
+(d2) maddubs only (no unpack)         28.465 us  0.0136 ns/weight     73.7 G weights/s  -
+(d5) unpack only (no maddubs)          7.934 us  0.0038 ns/weight    264.3 G weights/s  -
+(d6) 2 maddubs per 32B codes           8.494 us  0.0041 ns/weight    246.9 G weights/s  -
+(d3) vpdpbusd ymm only                13.915 us  0.0066 ns/weight    150.7 G weights/s  -
+(d4) vpdpbusd zmm only                11.291 us  0.0054 ns/weight    185.7 G weights/s  -
+
+-- variants (bitwise identity is against (a), the shipped kernel) --
+X1 AVX2 mask-only 3 classes           27.555 us  0.0131 ns/weight     76.1 G weights/s  max diff 0  1.03x vs (a)
+X2 AVX2 mask-only 4 classes           27.354 us  0.0130 ns/weight     76.7 G weights/s  max diff 0  1.04x vs (a)
+X3 VNNI ymm mask-only                 25.192 us  0.0120 ns/weight     83.2 G weights/s  max diff 0  1.13x vs (a)
+X4 VNNI zmm broadcast-mask            26.850 us  0.0128 ns/weight     78.1 G weights/s  max diff 0  1.06x vs (a)
+X5 VNNI ymm, 2 rows                   24.285 us  0.0116 ns/weight     86.4 G weights/s  max diff 0  1.17x vs (a)
+X6 VNNI ymm, 4 rows                   21.452 us  0.0102 ns/weight     97.8 G weights/s  max diff 0  1.32x vs (a)
+
+=== RUN 3, real TQ2_0 blocks from bitnet-2b4t-TQ2_0.gguf ===
+weights: real TQ2_0 blocks from real_tq2_blocks.bin
+matrix 2048 x 1024 TQ2_0  codes+scales 0.541 MB  (2097152 weights)
+build: AVX2=1 AVX512F=1 AVX512VL=1 AVX512VNNI=1 AVX512BW=1
+shipped AVX2 vec_dot vs scalar ref maxrel 8.16e-05
+(a) vec_dot AVX2 (shipped)            28.707 us  0.0137 ns/weight     73.1 G weights/s  baseline
+(c) load only (mem floor)              4.684 us  0.0022 ns/weight    447.7 G weights/s  -
+(d2) maddubs only (no unpack)         28.822 us  0.0137 ns/weight     72.8 G weights/s  -
+(d5) unpack only (no maddubs)          7.964 us  0.0038 ns/weight    263.3 G weights/s  -
+(d6) 2 maddubs per 32B codes           8.579 us  0.0041 ns/weight    244.5 G weights/s  -
+(d3) vpdpbusd ymm only                13.831 us  0.0066 ns/weight    151.6 G weights/s  -
+(d4) vpdpbusd zmm only                11.022 us  0.0053 ns/weight    190.3 G weights/s  -
+
+-- variants (bitwise identity is against (a), the shipped kernel) --
+X1 AVX2 mask-only 3 classes           27.540 us  0.0131 ns/weight     76.1 G weights/s  max diff 0  1.05x vs (a)
+X2 AVX2 mask-only 4 classes           27.473 us  0.0131 ns/weight     76.3 G weights/s  max diff 0  1.06x vs (a)
+X3 VNNI ymm mask-only                 25.218 us  0.0120 ns/weight     83.2 G weights/s  max diff 0  1.15x vs (a)
+X4 VNNI zmm broadcast-mask            26.973 us  0.0129 ns/weight     77.8 G weights/s  max diff 0  1.08x vs (a)
+X5 VNNI ymm, 2 rows                   24.329 us  0.0116 ns/weight     86.2 G weights/s  max diff 0  1.19x vs (a)
+X6 VNNI ymm, 4 rows                   21.331 us  0.0102 ns/weight     98.3 G weights/s  max diff 0  1.36x vs (a)
