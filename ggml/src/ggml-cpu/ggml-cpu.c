@@ -3135,7 +3135,7 @@ struct ggml_cplan ggml_graph_plan(
             fprintf(stderr, "mm: weight_working_set=%.2f MB threshold=%.2f MB static1_resident=%s\n",
                     mm_weight_bytes / 1048576.0,
                     ggml_mm_static_max_bytes() == (size_t) -1 ? -1.0 : ggml_mm_static_max_bytes() / 1048576.0,
-                    (mm_weight_bytes > 0 && mm_weight_bytes <= ggml_mm_static_max_bytes()) ? "yes" : "no");
+                    ggml_mm_static_resident(mm_weight_bytes) ? "yes" : "no");
         }
     }
 
@@ -3221,6 +3221,10 @@ int  ggml_wbuf_slots       (void) { if (ggml_mm_f_wbuf_slots     < 0) ggml_tail_
 size_t ggml_mm_static_max_bytes(void) {
     if (ggml_mm_f_static_max_mb < 0) ggml_tail_init();
     return ggml_mm_f_static_max_mb == 0 ? (size_t) -1 : (size_t) ggml_mm_f_static_max_mb * 1024 * 1024;
+}
+
+bool ggml_mm_static_resident(size_t mm_weight_bytes) {
+    return mm_weight_bytes > 0 && mm_weight_bytes <= ggml_mm_static_max_bytes();
 }
 
 // ---------------- moe-tail: pool-wide barrier elision for row-local runs ----------------

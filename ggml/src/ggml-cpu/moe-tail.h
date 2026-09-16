@@ -52,6 +52,11 @@ int  ggml_tail_mm_chunks(void);
 bool ggml_mm_parquant(void);
 bool ggml_mm_static1(void);
 size_t ggml_mm_static_max_bytes(void);
+
+// The residency test itself, in ONE place. The matmul's gate and the GGML_CPU_MM_STATS
+// line both call this and nothing else, so a change to the rule cannot move one without
+// moving the other and tests/mm-invoke-residency-gate.sh can fail on it.
+bool ggml_mm_static_resident(size_t mm_weight_bytes);
 bool ggml_mm_dispatch(void);
 int  ggml_wbuf_slots(void);
 

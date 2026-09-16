@@ -4658,8 +4658,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // per-matrix threshold and a per-matrix test would change nothing. The working sets
         // are 7.9 MB (synth-L1), 14.1 MB (synth-L2), 100.7 MB (synth-L16), 512 MB (BitNet)
         // and gigabytes (Maple), which 16 MB cuts exactly where the measurement does.
-        const bool mm_resident = params->mm_weight_bytes > 0 &&
-                                 params->mm_weight_bytes <= ggml_mm_static_max_bytes();
+        const bool mm_resident = ggml_mm_static_resident(params->mm_weight_bytes);
 
         const bool mm_static1 = ggml_mm_static1() && mm_resident && ne11 == 1 && ne12 == 1 &&
                                 ne02 == 1 && nr0_static == ne01 && ne01 >= NB_COLS;
