@@ -78,13 +78,20 @@ for tag in s1_wait_never s2_publish_early s3_no_wbuf s4_no_war s5_wait_thread0; 
     fi
     echo "=== SABOTAGE $tag"
     for rep in 1 2 3; do
-        out=$($PIN ./build-dp/bin/test-moe-tail-identity 2>&1); rc=$?
-        v=$(echo "$out" | grep -E "test-moe-tail-identity: (PASS|FAIL)" | tail -1)
+        # A sabotaged schedule can LIVE-LOCK rather than differ: garbage expert scores
+        # reaching the ARGSORT put std::sort in front of a comparator that is not a strict
+        # weak ordering, which is undefined behaviour and in practice does not return. A
+        # run that does not terminate is a detection, not a pass, and is reported as one.
+        out=$(timeout 180 $PIN ./build-dp/bin/test-moe-tail-identity 2>&1); rc=$?
+        if [ $rc -eq 124 ]; then out="test-moe-tail-identity: TIMEOUT after 180s (did not terminate)"; fi
+        v=$(echo "$out" | grep -E "test-moe-tail-identity: (PASS|FAIL|TIMEOUT)" | tail -1)
         first=$(echo "$out" | grep "DIFFERS" | head -1)
         echo "   rep $rep unit: exit=$rc ${v:-<no verdict>} ${first}"
         got=$(mktemp)
-        $PIN ./build-dp/bin/llama-moe-tail-hash -m $M -p "The capital of France is" -t 4 -ngl 0 > $got 2>/dev/null
-        if diff -q $ref $got >/dev/null; then echo "   rep $rep hash: IDENTICAL (NOT caught)"
+        timeout 300 $PIN ./build-dp/bin/llama-moe-tail-hash -m $M -p "The capital of France is" -t 4 -ngl 0 > $got 2>/dev/null
+        hrc=$?
+        if [ $hrc -ne 0 ]; then echo "   rep $rep hash: exit=$hrc (crash, abort or timeout) CAUGHT"
+        elif diff -q $ref $got >/dev/null; then echo "   rep $rep hash: IDENTICAL (NOT caught)"
         else echo "   rep $rep hash: DIFFERS ($(diff $ref $got | grep -c '^<') lines) CAUGHT"; fi
         rm -f $got
     done
