@@ -23,7 +23,7 @@ git diff --quiet -- $F $C || { echo "REFUSED: the tree is already modified"; exi
 
 # model, threshold MB, expected decision
 CASES="synth/synth-L1-TQ2_0:16:yes synth/synth-L2-TQ2_0:16:yes synth/synth-L16-TQ2_0:16:no synth/synth-L16-TQ2_0:1024:yes"
-CASES="$CASES ../bitnet-2b4t-TQ2_0:16:no ../bitnet-2b4t-TQ2_0:1024:yes synth/synth-L1-TQ2_0:1:no synth/synth-L2-TQ2_0:14:no"
+CASES="$CASES bitnet-2b4t-TQ2_0:16:no bitnet-2b4t-TQ2_0:1024:yes synth/synth-L1-TQ2_0:1:no synth/synth-L2-TQ2_0:14:no"
 
 check() { # prints one line per case, returns the number that disagreed
   local bad=0
