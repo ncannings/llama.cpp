@@ -3409,7 +3409,7 @@ static int ggml_cpu_try_fuse_ops(
 // "when" never lets a thread read bytes another thread has not finished writing, and
 // never lets a thread overwrite bytes another thread is still reading.
 //
-// The three hazard classes the planner checks between slots j < s (ggml_psched_indep):
+// The three hazard classes the planner checks between slots j < s (ggml_psched_indep_why):
 //
 //   RAW  s reads bytes j wrote.   Disjoint byte spans, or an exact row-aligned alias.
 //   WAR  s writes bytes j reads.  Same test, in the other direction. This is the one
@@ -3557,12 +3557,6 @@ static const char * ggml_psched_why_name(int w) {
 }
 
 // May slot s start without waiting for every thread to finish slot j (j < s)?
-static bool ggml_psched_indep_why(const struct ggml_psched_slot * sl, int j, int s, int * why);
-static bool ggml_psched_indep(const struct ggml_psched_slot * sl, int j, int s) {
-    int why = 0;
-    return ggml_psched_indep_why(sl, j, s, &why);
-}
-
 static bool ggml_psched_indep_why(const struct ggml_psched_slot * sl, int j, int s, int * why) {
     const struct ggml_psched_slot * pj = &sl[j];
     const struct ggml_psched_slot * ps = &sl[s];
