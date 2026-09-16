@@ -9348,7 +9348,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         }
 
         if (ith == 0) {
-            ggml_threadpool_chunk_set(params->threadpool, nth);
+            ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
         }
 
         ggml_barrier(params->threadpool);
@@ -9381,7 +9381,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
             }
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
         }
     }
 }
@@ -11110,7 +11110,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
     }
 
     if (ith == 0) {
-      ggml_threadpool_chunk_set(params->threadpool, nth);
+      ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
     }
 
     ggml_barrier(params->threadpool);
@@ -11124,7 +11124,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
         ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
-        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
     }
 }
 

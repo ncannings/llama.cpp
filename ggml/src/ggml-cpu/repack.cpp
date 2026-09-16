@@ -4572,6 +4572,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
+        // mm-invoke change 1: PARALLEL src1 QUANTISATION AT ONE ROW.
+        //
+        // The loops below split src1 by ROWS, so at decode (ne11 == 1) thread 0 quantises the
+        // only row and every other thread goes straight to the internal barrier and waits for
+        // it. Measured on the A725 quad that is the single largest per-invocation item: the
+        // barrier costs 0.5 us on thread 0 and 2.5 to 4.0 us on the others, and the difference
+        // IS this serial quantisation (2.4 us at ne10 = 1536, 3.8 us at 2560).
+        //
+        // Every quantisation format used as PARAM_TYPE here derives a block ENTIRELY from its
+        // own elements: quantize_row_q8_K_ref takes amax over its 256 floats and quantize_row_q8_0
+        // over its 32, with no state carried between blocks. So a call on a sub-range of WHOLE
+        // blocks writes exactly the bytes the whole-row call would have written for those blocks,
+        // and splitting the row's blocks across threads is bit-identical. It changes which thread
+        // writes a byte, never the byte.
+        //
+        // Restricted to the one-row one-plane case, which is decode: with more rows than threads
+        // the existing row split already has work for everyone.
+        const int64_t q_blck = ggml_blck_size(PARAM_TYPE);
+        const size_t  q_tsz  = ggml_type_size(PARAM_TYPE);
+        const bool    q_par  = ggml_mm_parquant() && nth > 1 && ne12 == 1 && ne11 == 1 &&
+                               q_blck > 0 && (ne10 % q_blck) == 0 && (ne10 / q_blck) > 1;
+
+        if (q_par) {
+            const int64_t nblk = ne10 / q_blck;
+            const int64_t b0   = ((int64_t) ith       * nblk) / nth;
+            const int64_t b1   = ((int64_t) (ith + 1) * nblk) / nth;
+            if (b1 > b0) {
+                from_float((float *) ((char *) src1->data) + b0 * q_blck,
+                           (void *) (wdata + (size_t) b0 * q_tsz), (b1 - b0) * q_blck);
+            }
+        } else {
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
@@ -4589,6 +4620,47 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
+        }
+
+        const int64_t nr0_static = ggml_nrows(op->src[0]);
+
+        // mm-invoke change 2: STATIC ROW SPLIT AT ONE ROW, NO CHUNK COUNTER.
+        //
+        // At decode the work-stealing loop below cuts src0 into nth * GGML_CPU_MM_CHUNKS
+        // chunks and hands them out through the threadpool's single shared atomic counter:
+        // one relaxed store, one barrier and about four contended fetch_adds per thread per
+        // matmul, plus the chunk geometry (two divisions, a MIN chain and the NB_COLS
+        // rounding) recomputed on every call. There is nothing to balance: at one token every
+        // chunk is the same number of output rows over the same ne00, so a fixed contiguous
+        // range per thread does the same work.
+        //
+        // Bit-identity is the same argument the GGML_CPU_MM_CHUNKS comment below already makes.
+        // Each output row is its own dot product over the whole of ne00; which thread computes
+        // it, and how many rows are passed to one gemv call, changes neither the accumulation
+        // order within a row nor the order of rows within a thread. The boundaries are rounded
+        // up to NB_COLS exactly as the chunk loop rounds them, so every row is covered exactly
+        // once and the repacked group a gemv call sees is the same group.
+        //
+        // It also takes this node OFF the shared chunk counter entirely, which is what lets the
+        // work-buffer regions of change 4 make two decode matmuls independent.
+        const bool mm_static1 = ggml_mm_static1() && ne11 == 1 && ne12 == 1 && ne02 == 1 &&
+                                nr0_static == ne01 && ne01 >= NB_COLS;
+
+        if (mm_static1) {
+            int64_t src0_start = ((int64_t) ith       * ne01) / nth;
+            int64_t src0_end   = ((int64_t) (ith + 1) * ne01) / nth;
+
+            src0_start = (src0_start % NB_COLS) ? src0_start + NB_COLS - (src0_start % NB_COLS) : src0_start;
+            src0_end   = (src0_end   % NB_COLS) ? src0_end   + NB_COLS - (src0_end   % NB_COLS) : src0_end;
+            src0_end   = MIN(src0_end, ne01);
+
+            ggml_barrier(params->threadpool);
+
+            if (src0_start < src0_end) {
+                forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, 0, ne11);
+            }
+            return;
+        }
 
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
@@ -4597,7 +4669,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // This only changes how the work-stealing loop below cuts src0 into chunks;
         // every chunk is still a whole set of output rows computed by one thread with
         // the same dot products in the same order, so the result does not depend on it.
-        const int64_t nr0 = ggml_nrows(op->src[0]);
+        const int64_t nr0 = nr0_static;
 
         int     nth_scaled  = nth * ggml_tail_mm_chunks();
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
@@ -4631,7 +4703,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         if (ith == 0) {
             // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-            ggml_threadpool_chunk_set(params->threadpool, nth);
+            ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
         }
 
         ggml_barrier(params->threadpool);
@@ -4658,13 +4730,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             // Make sure current plane is the last one before exiting
             if (src0_start >= src0_end) {
-                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+                current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
                 continue;
             }
 
             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
         }
     }
 

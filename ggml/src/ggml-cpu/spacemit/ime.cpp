@@ -66,8 +66,8 @@
 // clang-format on
 
 extern "C" {
-extern void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
-extern int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+extern void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int slot, int value);
+extern int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int slot, int value);
 }
 
 namespace ggml::cpu::riscv64_spacemit {
@@ -1198,7 +1198,7 @@ class tensor_traits_common : public tensor_traits_base {
 
         if (ith == 0) {
             // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-            ggml_threadpool_chunk_set(params->threadpool, nth);
+            ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
         }
 
         ggml_barrier(params->threadpool);
@@ -1223,7 +1223,7 @@ class tensor_traits_common : public tensor_traits_base {
                     ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
             }
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
         }
     }
 

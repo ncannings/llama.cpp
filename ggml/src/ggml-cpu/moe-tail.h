@@ -13,8 +13,19 @@
 //   GGML_CPU_NO_SUMROWS_PAR=1    restore single-threaded SUM_ROWS
 //   GGML_CPU_NO_BARRIER_RUN=1    restore one pool-wide barrier after every node
 //   GGML_CPU_MM_CHUNKS=<n>       chunks per thread in the repack matmul (default 4)
+//
+// mm-invoke: per-invocation cost inside the repack forward_mul_mat.
+//
+//   GGML_CPU_NO_MM_PARQUANT=1    restore the serial src1 quantisation at ne11 == 1
+//   GGML_CPU_NO_MM_STATIC1=1     restore the work-stealing chunk loop at ne11 == 1
+//   GGML_CPU_NO_MM_DISPATCH=1    restore the std::vector walk in the extra-buffer dispatch
+//   GGML_CPU_WBUF_SLOTS=<n>      work-buffer regions in the cplan (1 = the single shared
+//                                buffer, the upstream behaviour; default 1)
 
 #include <stdbool.h>
+
+// Maximum number of work-buffer regions a cplan may carry (GGML_CPU_WBUF_SLOTS).
+#define GGML_WBUF_SLOTS_MAX 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +42,17 @@ bool ggml_tail_barrier_run(void);
 // barrier. Disable with GGML_CPU_NO_PSCHED=1.
 bool ggml_psched_enabled(void);
 int  ggml_tail_mm_chunks(void);
+
+// mm-invoke switches. Each changes only which thread does a piece of work or
+// where a scratch byte lives, never an arithmetic result.
+bool ggml_mm_parquant(void);
+bool ggml_mm_static1(void);
+bool ggml_mm_dispatch(void);
+int  ggml_wbuf_slots(void);
+
+// Fill the flat extra-buffer dispatch cache. Called from ggml_graph_compute, before any
+// worker thread exists.
+void ggml_cpu_extra_cache_init(void);
 
 #ifdef __cplusplus
 }

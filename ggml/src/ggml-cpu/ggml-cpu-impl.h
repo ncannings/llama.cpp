@@ -27,6 +27,10 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // mm-invoke: which work-buffer region this node was given, and therefore which of the
+    // threadpool's chunk counters it may use. Always 0 when work-buffer regions are off.
+    int wslot;
 };
 
 
@@ -531,8 +535,8 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
-void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
-int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int slot, int value);
+int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int slot, int value);
 
 #ifdef __cplusplus
 }

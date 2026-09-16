@@ -910,7 +910,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             }
 
             if (ith == 0) {
-                ggml_threadpool_chunk_set(params->threadpool, 0);
+                ggml_threadpool_chunk_set(params->threadpool, params->wslot, 0);
             }
 
             ggml_barrier(params->threadpool);
@@ -918,7 +918,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             const size_t chunk_cols = kleidiai_chunk_cols(n, nth, disable_chunking, n_step);
             GGML_ASSERT(chunk_cols <= (size_t) INT_MAX);
 
-            int current_col = ggml_threadpool_chunk_add(params->threadpool, (int) chunk_cols);
+            int current_col = ggml_threadpool_chunk_add(params->threadpool, params->wslot, (int) chunk_cols);
             while ((size_t) current_col < n) {
                 const size_t n_start = (size_t) current_col;
                 const size_t n_to_process = std::min(chunk_cols, n - n_start);
@@ -944,7 +944,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                                           FLT_MAX);
                 }
 
-                current_col = ggml_threadpool_chunk_add(params->threadpool, (int) chunk_cols);
+                current_col = ggml_threadpool_chunk_add(params->threadpool, params->wslot, (int) chunk_cols);
             }
 
             if (batch_idx != ne12 - 1) {
@@ -1438,7 +1438,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             }
 
             if (ith_total == 0) {
-                ggml_threadpool_chunk_set(params->threadpool, nth_total);
+                ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth_total);
             }
 
             // Publishes both LHS packing and the initialized dynamic chunk queue.
@@ -1459,7 +1459,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                     run_chunk(slot, global_start, cols, dst_batch_base);
                 }
 
-                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+                current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
             }
 
             if (batch_idx != ne12 - 1) {

@@ -493,6 +493,12 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
+    // mm-invoke: one work-stealing counter per work-buffer region, each alone on a cache
+    // line. Slot 0 IS current_chunk above; the extra slots exist only when the cplan cuts
+    // the work buffer into regions, so that two matmuls in different regions do not share
+    // the counter that would otherwise make them dependent.
+    struct { atomic_int GGML_CACHE_ALIGN v; } chunk_slot[GGML_WBUF_SLOTS_MAX];
+
     // persistent-sched: per-thread progress counter, one per cache line. prog[t] is the
     // number of scheduler slots thread t has completed in the current graph.
     struct { atomic_int GGML_CACHE_ALIGN v; } psched_prog[GGML_MAX_N_THREADS];
@@ -617,12 +623,19 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #endif
 }
 
-void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
-    atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
+void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int slot, int value) {
+    if (slot <= 0) {
+        atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
+        return;
+    }
+    atomic_store_explicit(&tp->chunk_slot[slot & (GGML_WBUF_SLOTS_MAX - 1)].v, value, memory_order_relaxed);
 }
 
-int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
-    return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
+int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int slot, int value) {
+    if (slot <= 0) {
+        return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
+    }
+    return atomic_fetch_add_explicit(&tp->chunk_slot[slot & (GGML_WBUF_SLOTS_MAX - 1)].v, value, memory_order_relaxed);
 }
 
 #if defined(__gnu_linux__)
@@ -1377,7 +1390,7 @@ UseGgmlGemm1:;
 
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
     }
 
     ggml_barrier(params->threadpool);
@@ -1473,7 +1486,7 @@ UseGgmlGemm2:;
             break;
         }
 
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
     }
 }
 
@@ -3065,6 +3078,27 @@ struct ggml_cplan ggml_graph_plan(
         work_size = MAX(work_size, cur);
     }
 
+    // mm-invoke change 4: ONE WORK-BUFFER REGION PER CONCURRENT NODE.
+    //
+    // Upstream sizes ONE work buffer to the largest single node's requirement and hands the
+    // same bytes to every node in turn. That is the reason the persistent schedule found no
+    // slack on a dense decode layer: eleven of its nineteen waits are WBUF waits, and three
+    // of those eleven carry no data dependency at all (Vcur, Kcur and cache_v depend only on
+    // the norm ahead of them). Two nodes that both stage through the same bytes can never be
+    // independent however the graph is shaped.
+    //
+    // With work_slots > 1 the buffer is cut into work_slots regions of the same size and node
+    // n of the graph is given region n % work_slots. The mapping is a pure function of the
+    // node index, so the schedule planner computes the same regions the compute loop uses
+    // without communicating. It costs (work_slots - 1) extra copies of the single largest
+    // node's scratch: at decode that is one quantised activation row, kilobytes.
+    const int wslots = ggml_wbuf_slots();
+    size_t    wregion = 0;
+    if (wslots > 1 && work_size > 0) {
+        wregion   = GGML_PAD(work_size, CACHE_LINE_SIZE);
+        work_size = wregion * (size_t) wslots;
+    }
+
     if (work_size > 0) {
         work_size += CACHE_LINE_SIZE*(n_threads);
     }
@@ -3073,6 +3107,8 @@ struct ggml_cplan ggml_graph_plan(
     cplan.n_threads  = MIN(max_tasks, n_threads);
     cplan.work_size  = work_size;
     cplan.work_data  = NULL;
+    cplan.work_region = wregion;
+    cplan.work_slots  = (wregion > 0) ? wslots : 1;
 
     return cplan;
 }
@@ -3089,6 +3125,10 @@ static int ggml_tail_f_sumrows_par  = -1;
 static int ggml_tail_f_barrier_run  = -1;
 static int ggml_tail_f_psched      = -1;
 static int ggml_tail_f_mm_chunks    = -1;
+static int ggml_mm_f_parquant       = -1;
+static int ggml_mm_f_static1        = -1;
+static int ggml_mm_f_dispatch       = -1;
+static int ggml_mm_f_wbuf_slots     = -1;
 
 static int ggml_tail_env_off(const char * name) {
     const char * e = getenv(name);
@@ -3107,6 +3147,16 @@ void ggml_tail_init(void) {
         if (v < 1)   v = 1;
         if (v > 256) v = 256;
         ggml_tail_f_mm_chunks = v;
+    }
+    ggml_mm_f_parquant = ggml_tail_env_off("GGML_CPU_NO_MM_PARQUANT");
+    ggml_mm_f_static1  = ggml_tail_env_off("GGML_CPU_NO_MM_STATIC1");
+    ggml_mm_f_dispatch = ggml_tail_env_off("GGML_CPU_NO_MM_DISPATCH");
+    {
+        const char * e = getenv("GGML_CPU_WBUF_SLOTS");
+        int v = e ? atoi(e) : 1;
+        if (v < 1)               v = 1;
+        if (v > GGML_WBUF_SLOTS_MAX) v = GGML_WBUF_SLOTS_MAX;
+        ggml_mm_f_wbuf_slots = v;
     }
 }
 
@@ -3128,6 +3178,10 @@ bool ggml_tail_sumrows_par (void) { if (ggml_tail_f_sumrows_par  < 0) ggml_tail_
 bool ggml_tail_barrier_run (void) { if (ggml_tail_f_barrier_run  < 0) ggml_tail_init(); return ggml_tail_f_barrier_run  != 0; }
 bool ggml_psched_enabled   (void) { if (ggml_tail_f_psched       < 0) ggml_tail_init(); return ggml_tail_f_psched       != 0; }
 int  ggml_tail_mm_chunks   (void) { if (ggml_tail_f_mm_chunks    < 0) ggml_tail_init(); return ggml_tail_f_mm_chunks;        }
+bool ggml_mm_parquant      (void) { if (ggml_mm_f_parquant       < 0) ggml_tail_init(); return ggml_mm_f_parquant       != 0; }
+bool ggml_mm_static1       (void) { if (ggml_mm_f_static1        < 0) ggml_tail_init(); return ggml_mm_f_static1        != 0; }
+bool ggml_mm_dispatch      (void) { if (ggml_mm_f_dispatch       < 0) ggml_tail_init(); return ggml_mm_f_dispatch       != 0; }
+int  ggml_wbuf_slots       (void) { if (ggml_mm_f_wbuf_slots     < 0) ggml_tail_init(); return ggml_mm_f_wbuf_slots;          }
 
 // ---------------- moe-tail: pool-wide barrier elision for row-local runs ----------------
 //
@@ -3457,6 +3511,18 @@ struct ggml_psched_stage {
     int why  [GGML_PSCHED_MAX_SLOTS]; // diagnostic: what stopped the backward scan
 };
 
+// mm-invoke: which work-buffer region a graph node is given. A pure function of the node
+// index, so the compute loop and this planner agree without communicating. Node indices,
+// not slot indices: a fused pair consumes two node indices and takes the region of its
+// first, which is the node the loop passes to ggml_compute_forward.
+int ggml_psched_wslot(int node_n, int wslots) {
+    if (wslots <= 1) {
+        return 0;
+    }
+    int r = node_n % wslots;
+    return r < 0 ? r + wslots : r;
+}
+
 // Does this op touch the shared cplan work buffer or the threadpool chunk counter?
 // Derived by reading every `params->wdata` and `current_chunk` use in the CPU backend.
 // Unknown ops answer true, which is the safe answer.
@@ -3534,6 +3600,7 @@ struct ggml_psched_slot {
     const struct ggml_tensor * src[GGML_MAX_SRC];
     int   nsrc;
     bool  wbuf;
+    int   wslot;  // mm-invoke: which work-buffer region this node stages through
     bool  rows;
     int64_t nr;
 };
@@ -3561,8 +3628,14 @@ static bool ggml_psched_indep_why(const struct ggml_psched_slot * sl, int j, int
     const struct ggml_psched_slot * pj = &sl[j];
     const struct ggml_psched_slot * ps = &sl[s];
 
-    // WBUF: the shared work buffer and the chunk counter.
-    if (pj->wbuf && ps->wbuf) {
+    // WBUF: the work buffer and the chunk counter.
+    //
+    // With one shared region (the upstream cplan, GGML_CPU_WBUF_SLOTS=1) any two work-buffer
+    // users collide and this is an unconditional refusal. With regions the collision is only
+    // between nodes given the SAME region: different regions are different bytes and, since
+    // mm-invoke change 4, different chunk counters. Everything else about the rule is
+    // unchanged, including that an op the planner does not understand answers wbuf = true.
+    if (pj->wbuf && ps->wbuf && pj->wslot == ps->wslot) {
         *why = PSCHED_WHY_WBUF;
         return false;
     }
@@ -3657,9 +3730,10 @@ static void ggml_psched_plan(
         const int nf = ggml_cpu_fuse_len(cgraph, cplan, g);
 
         struct ggml_psched_slot * p = &sl[s];
-        p->nsrc = 0;
-        p->rows = false;
-        p->nr   = 0;
+        p->nsrc  = 0;
+        p->rows  = false;
+        p->nr    = 0;
+        p->wslot = ggml_psched_wslot(g, (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1);
 
         if (nf > 0) {
             // RMS_NORM + MUL: the tensor actually written is the MUL's destination and
@@ -3821,7 +3895,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.wslot      =*/ 0,
     };
+
+    // mm-invoke: work-buffer regions. A node's region is a pure function of its index, so
+    // every thread hands the same node the same bytes without communicating, and the
+    // schedule planner derives the same mapping (ggml_psched_wslot).
+    const int    wslots  = (cplan->work_region > 0 && cplan->work_slots > 1) ? cplan->work_slots : 1;
+    const size_t wregion = cplan->work_region;
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -3879,6 +3960,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
             GGML_ASSERT(st.gnode[psched_slot] == node_n);
             ggml_psched_wait(tp, st.wait[psched_slot], params.nth);
+        }
+
+        if (wslots > 1) {
+            params.wslot = ggml_psched_wslot(node_n, wslots);
+            params.wdata = (char *) cplan->work_data + (size_t) params.wslot * wregion;
+            params.wsize = wregion;
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -4142,6 +4229,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
+    ggml_cpu_extra_cache_init();
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);

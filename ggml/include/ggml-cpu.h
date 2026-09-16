@@ -22,6 +22,13 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // mm-invoke: work-buffer REGIONS. work_slots > 1 means work_data is cut into
+        // work_slots regions of work_region bytes each and node n of the graph is given
+        // region n % work_slots as its wdata, instead of every node sharing one buffer.
+        // Zero and one are the upstream behaviour: one region, shared.
+        size_t work_region;
+        int    work_slots;
     };
 
     // numa strategies

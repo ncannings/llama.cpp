@@ -1248,6 +1248,6 @@ void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params,
             }
         }
 
-        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, params->wslot, 1);
     }
 }
