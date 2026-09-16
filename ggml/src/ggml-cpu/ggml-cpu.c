@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "moe-tail.h"
+#include "tq2-kernel.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3102,6 +3103,18 @@ void ggml_tail_init(void) {
         ggml_tail_f_mm_chunks = v;
     }
 }
+
+// TQ2_0 kernel selection, same lazy-cached-env shape as the switches above. "old" selects
+// the shift-and-mask unpack, anything else (including unset) selects the mask-only unpack.
+// Both produce identical integer sums; see ggml/src/ggml-cpu/tq2-kernel.h.
+static int ggml_tq2_f_new = -1;
+
+void ggml_tq2_kernel_init(void) {
+    const char * e = getenv("GGML_CPU_TQ2_KERNEL");
+    ggml_tq2_f_new = (e != NULL && strcmp(e, "old") == 0) ? 0 : 1;
+}
+
+bool ggml_tq2_kernel_new(void) { if (ggml_tq2_f_new < 0) ggml_tq2_kernel_init(); return ggml_tq2_f_new != 0; }
 
 bool ggml_tail_rows_flatten(void) { if (ggml_tail_f_rows_flatten < 0) ggml_tail_init(); return ggml_tail_f_rows_flatten != 0; }
 bool ggml_tail_bcast_scalar(void) { if (ggml_tail_f_bcast_scalar < 0) ggml_tail_init(); return ggml_tail_f_bcast_scalar != 0; }
