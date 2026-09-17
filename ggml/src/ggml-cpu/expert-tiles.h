@@ -72,6 +72,10 @@ void ggml_expert_tiles_plan(int n_threads);
 // Apply thread ith's pin. Called by each worker, after the plan. Cheap and idempotent.
 void ggml_expert_tiles_apply(int ith);
 
+// The thread count the current plan was built for. A caller whose pool differs from this
+// is looking at a plan that does not describe it, and must refuse rather than use it.
+int ggml_expert_tiles_planned_for(void);
+
 int ggml_expert_tiles_n_domains(void);      // number of L3 domains in the pool
 int ggml_expert_tiles_thread_domain(int ith);  // domain of thread ith
 int ggml_expert_tiles_domain_nth(int dom);     // threads in that domain

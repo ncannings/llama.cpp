@@ -4878,6 +4878,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // placed(), not enabled(): mode 2 applies the same pinning but leaves the deal
         // pool-wide, which is the control that separates the pin from the placement.
         const bool tiles = ggml_expert_tiles_placed();
+
+        // THE POOL MUST BE THE POOL THE PLAN DESCRIBES. The plan is built from
+        // cplan->n_threads on the main thread; nth here is what the pool actually turned out
+        // to be, and OpenMP may hand back fewer (OMP_THREAD_LIMIT), as may the pthread pool
+        // when the cplan asks for more threads than the threadpool holds. If they differ, the
+        // domain thread counts below are wrong in the ONE direction that loses work: the steal
+        // counter is primed for ranks that do not exist, so their chunks are never claimed and
+        // their experts are never computed. That would be a wrong answer, not a slow one, so
+        // it refuses. This cannot be checked at plan time because the shortfall happens after.
+        if (tiles && nth != ggml_expert_tiles_planned_for()) {
+            GGML_ABORT("expert-tiles: pool is %d threads but the plan was built for %d. "
+                       "Expert work would be lost; refusing.", nth, ggml_expert_tiles_planned_for());
+        }
         const int  ndom  = tiles ? ggml_expert_tiles_n_domains()        : 1;
         const int  dom   = tiles ? ggml_expert_tiles_thread_domain(ith) : 0;
         const int  dnth  = tiles ? ggml_expert_tiles_domain_nth(dom)    : nth;

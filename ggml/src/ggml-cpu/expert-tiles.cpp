@@ -360,6 +360,10 @@ void ggml_expert_tiles_apply(int ith) {
 #endif
 }
 
+int ggml_expert_tiles_planned_for(void) {
+    return g_plan.planned_for;
+}
+
 int ggml_expert_tiles_n_domains(void) {
     return g_plan.n_domains;
 }

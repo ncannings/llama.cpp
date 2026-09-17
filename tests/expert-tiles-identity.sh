@@ -77,6 +77,10 @@ refuse() { # refuse <what> <env...>
 THREADS=10 refuse "10 threads on a 5-cpu mask" GGML_CPU_EXPERT_TILES=1 GGML_CPU_SYSFS_ROOT=$ROOT || fail=1
 THREADS=4  refuse "unreadable topology"        GGML_CPU_EXPERT_TILES=1 GGML_CPU_SYSFS_ROOT=$OUT/nothing-here || fail=1
 THREADS=4  refuse "map beyond the domains"     GGML_CPU_EXPERT_TILES=1 GGML_CPU_SYSFS_ROOT=$ROOT GGML_CPU_EXPERT_TILE_MAP=0,5 || fail=1
+# The pool shrinking under a plan built for more threads is the one failure that would lose
+# expert work rather than slow it down, so it gets its own reachable case: OMP_THREAD_LIMIT
+# is the real mechanism that produces it.
+THREADS=4  refuse "pool smaller than the plan"  OMP_THREAD_LIMIT=3 GGML_CPU_EXPERT_TILES=1 GGML_CPU_SYSFS_ROOT=$ROOT || fail=1
 
 echo "== EXPERT-TILES KERNEL IDENTITY: $([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $fail
