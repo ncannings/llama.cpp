@@ -13,6 +13,13 @@
 // exactly 3 rows, and two 88-row routings. The results must be identical bit for bit, not
 // merely within tolerance: a padded row must not be able to move a real one.
 //
+// expert-tiles: GGML_TEST_THREADS overrides the thread list ("1,4,5") and GGML_TEST_HASH=1
+// adds an FNV-1a hash of the repacked output bytes to every line. Both exist so that this
+// test can be re-run under GGML_CPU_EXPERT_TILES=1, which pins one thread per cpu and so
+// cannot be oversubscribed to 10 threads on a five-core pin, and so that "tiles on equals
+// tiles off" can be checked as a byte comparison and not only through the tolerance.
+// Neither changes what is computed.
+//
 // Thread counts 1, 4 and 10 are all run, because the thread count selects the work partition
 // as well as the number of workers. forward_mul_mat_id splits the op by src0 columns when
 // there are fewer work items than threads and by (expert, group) work items at full column
@@ -128,6 +135,20 @@ static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t bu
     return true;
 }
 
+// FNV-1a over the raw output bytes. Printed only under GGML_TEST_HASH=1, so that a script
+// can require the expert placement to produce the SAME BYTES as the unplaced deal rather
+// than merely the same tolerance.
+static std::string fnv1a(const std::vector<float> & v) {
+    uint64_t h = 1469598103934665603ULL;
+    const uint8_t * p = (const uint8_t *) v.data();
+    for (size_t i = 0; i < v.size() * sizeof(float); i++) {
+        h = (h ^ p[i]) * 1099511628211ULL;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+    return std::string(buf);
+}
+
 int main(void) {
     ggml_backend_load_all();
 
@@ -146,7 +167,22 @@ int main(void) {
     const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
     const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
     const int64_t tokens[]    = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 17 };
-    const int     threads[]   = { 1, 4, 10 };
+    std::vector<int> threads = { 1, 4, 10 };
+    if (const char * e = getenv("GGML_TEST_THREADS")) {
+        threads.clear();
+        for (const char * p = e; *p; ) {
+            char * end = nullptr;
+            const long v = strtol(p, &end, 10);
+            if (end == p) { break; }
+            if (v > 0) { threads.push_back((int) v); }
+            p = (*end == ',') ? end + 1 : end;
+        }
+        if (threads.empty()) {
+            fprintf(stderr, "GGML_TEST_THREADS='%s' parsed to an empty list\n", e);
+            return 1;
+        }
+    }
+    const bool want_hash = getenv("GGML_TEST_HASH") != nullptr && atoi(getenv("GGML_TEST_HASH")) == 1;
     const int64_t n_as        = 4;
 
     std::mt19937 rng(1234);
@@ -201,8 +237,9 @@ int main(void) {
                 }
                 const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
                 const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
-                printf("%-6s t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s\n",
-                       ggml_type_name(wtype), nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL");
+                printf("%-6s t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
+                       ggml_type_name(wtype), nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL",
+                       want_hash ? "  fnv " : "", want_hash ? fnv1a(out_rep).c_str() : "");
                 ok = ok && pass;
             }
 
@@ -242,9 +279,10 @@ int main(void) {
                 }
                 const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
                 const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
-                printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
                        ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
-                       max_abs, max_diff, pass ? "OK" : "FAIL");
+                       max_abs, max_diff, pass ? "OK" : "FAIL",
+                       want_hash ? "  fnv " : "", want_hash ? fnv1a(out_rep).c_str() : "");
                 ok = ok && pass;
             }
 
@@ -285,9 +323,10 @@ int main(void) {
                     }
                     const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
                     const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
-                    printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s\n",
+                    printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
                            ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
-                           max_abs, max_diff, pass ? "OK" : "FAIL");
+                           max_abs, max_diff, pass ? "OK" : "FAIL",
+                           want_hash ? "  fnv " : "", want_hash ? fnv1a(out_rep).c_str() : "");
                     ok = ok && pass;
                 }
             }

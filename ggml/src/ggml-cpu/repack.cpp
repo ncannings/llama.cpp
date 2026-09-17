@@ -2,6 +2,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
 #include "moe-tail.h"
+#include "expert-tiles.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-impl.h"
@@ -4418,6 +4419,15 @@ template <> void gemm2<block_tq2_0, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size
 // here because both work_size() and forward_mul_mat_id() have to agree on it.
 static constexpr size_t MMID_STEAL_ALIGN = 64;
 
+// One counter slot per L3 domain when the expert placement is on, because stealing is
+// confined to the domain that owns the expert. Off, there is one pool-wide counter and the
+// layout is exactly what it was. Read from the env only, never from the plan, so that
+// work_size() (computed in ggml_graph_plan) and forward_mul_mat_id() (computed on the
+// workers, after the plan) cannot disagree about how many bytes are reserved.
+static inline size_t mmid_steal_slots() {
+    return ggml_expert_tiles_enabled() ? (size_t) GGML_EXPERT_TILES_MAX_DOMAINS : 1;
+}
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -4450,7 +4460,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     // the op's own work-stealing counter, alone on a cache line so that the
                     // threads hammering it do not share a line with the scratch below
                     size  = GGML_PAD(size, MMID_STEAL_ALIGN);
-                    size += MMID_STEAL_ALIGN;
+                    size += MMID_STEAL_ALIGN*mmid_steal_slots();
 
                     // per thread: the 4-row interleaved activation panel of one group, and the
                     // 4 x ne01 f32 tile the gemm writes before the rows are scattered to dst
@@ -4850,6 +4860,51 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
+        // ---------------------------------------------------------------- expert tiles
+        //
+        // Each expert INDEX is owned by one L3 domain and is computed only by the threads
+        // pinned to that domain, so the expert's ternary weights are only ever filled into
+        // that domain's L3 instead of into both. Everything the deal below is expressed in
+        // becomes domain-local: the work-item list, the steal counter, the column split and
+        // the thread count they are divided by. This op is the ONLY thing placed; the dense
+        // MUL_MAT that carries attention, the router and the head keeps the whole pool.
+        //
+        // There is no second threadpool and no second barrier. The op's single pool-wide
+        // barrier is the one it already had, and a barrier across the ten big cores costs
+        // 0.5 us, so the blueprint's argument for staying inside one pool holds.
+        //
+        // With the placement off, or on a machine whose mask covers one L3 domain, ndom is
+        // 1 and every line below is literally the pool-wide deal it replaced.
+        // placed(), not enabled(): mode 2 applies the same pinning but leaves the deal
+        // pool-wide, which is the control that separates the pin from the placement.
+        const bool tiles = ggml_expert_tiles_placed();
+        const int  ndom  = tiles ? ggml_expert_tiles_n_domains()        : 1;
+        const int  dom   = tiles ? ggml_expert_tiles_thread_domain(ith) : 0;
+        const int  dnth  = tiles ? ggml_expert_tiles_domain_nth(dom)    : nth;
+        const int  dith  = tiles ? ggml_expert_tiles_domain_rank(ith)   : ith;
+
+        // Which domain owns expert a. A pure function of the map, identical on every thread,
+        // which is what makes the item list below identical on every thread of a domain.
+        auto expert_dom = [ndom, n_as](int a) -> int {
+            return ndom > 1 ? ggml_expert_tiles_expert_domain(a, n_as) : 0;
+        };
+
+        // ASSERT the placement, do not infer it from a timing. Under
+        // GGML_CPU_EXPERT_TILES_VERBOSE=1 the first MUL_MAT_ID to run prints the map it
+        // actually used, so a job can require the routing it thinks it is measuring instead
+        // of reading it back out of a throughput number.
+        if (tiles && ith == 0 && getenv("GGML_CPU_EXPERT_TILES_VERBOSE") != NULL) {
+            static std::atomic<bool> printed{false};
+            bool expect = false;
+            if (printed.compare_exchange_strong(expect, true)) {
+                fprintf(stderr, "expert-tiles: MUL_MAT_ID n_expert %d over %d domains, map", n_as, ndom);
+                for (int a = 0; a < n_as && a < 64; ++a) {
+                    fprintf(stderr, " %d:%d", a, expert_dom(a));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
         const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
@@ -4872,8 +4927,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // see the work partition comment below for why that distinction is the whole safety
         // argument. int64_t so the chunk index cannot wrap, on its own cache line.
         woff = GGML_PAD(woff, MMID_STEAL_ALIGN);
-        auto * const steal_ctr = (std::atomic<int64_t> *) (wdata + woff);
-        woff += MMID_STEAL_ALIGN;
+        char * const steal_base = wdata + woff;
+        woff += MMID_STEAL_ALIGN*mmid_steal_slots();
+
+        // domain d's counter, alone on its own cache line
+        auto steal_ctr_at = [steal_base](int d) -> std::atomic<int64_t> & {
+            return *(std::atomic<int64_t> *) (steal_base + (size_t) d*MMID_STEAL_ALIGN);
+        };
 
         // per thread scratch: the interleaved panel of one group, and the gemm output tile
         woff = GGML_PAD(woff, 64);
@@ -4932,7 +4992,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // same single-writer guard as matrix_row_counts, so the barrier below publishes
             // both. nth rather than 0 because chunks 0 .. nth-1 are pre-assigned to threads
             // 0 .. nth-1 below, exactly as forward_mul_mat does with the threadpool counter.
-            steal_ctr->store(nth, std::memory_order_relaxed);
+            // One counter per domain: chunks 0 .. dnth-1 of domain d are pre-assigned to
+            // that domain's threads by rank, exactly as chunks 0 .. nth-1 were pool-wide.
+            for (int d = 0; d < ndom; ++d) {
+                steal_ctr_at(d).store(tiles ? ggml_expert_tiles_domain_nth(d) : nth,
+                                      std::memory_order_relaxed);
+            }
         }
 
         ggml_barrier(params->threadpool);
@@ -4997,16 +5062,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
         };
 
+        //
+        // n_items counts MY DOMAIN's items only, and the row/column decision is taken per
+        // domain, because the domains' work is disjoint: an expert belongs to one domain,
+        // and the dst rows of distinct experts are disjoint, so two domains can be dealt
+        // differently without either being able to see the other's bytes.
         int64_t n_items = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (expert_dom(cur_a) != dom) {
+                continue;
+            }
             n_items += expert_items(matrix_row_counts[cur_a]);
         }
 
-        const bool split_rows = n_items >= nth;
+        const bool split_rows = n_items >= dnth;
 
-        // the src0 column range does not depend on the expert, so split it once
-        int64_t src0_cur_start = split_rows ? 0    : (ith * ne01) / nth;
-        int64_t src0_cur_end   = split_rows ? ne01 : ((ith + 1) * ne01) / nth;
+        // the src0 column range does not depend on the expert, so split it once. Over the
+        // DOMAIN's threads: the five threads of a domain split the columns of that domain's
+        // experts between them, so the whole expert tensor still lands in one L3.
+        int64_t src0_cur_start = split_rows ? 0    : (dith * ne01) / dnth;
+        int64_t src0_cur_end   = split_rows ? ne01 : ((dith + 1) * ne01) / dnth;
 
         if (!split_rows) {
             // Align boundaries to NB_COLS - round up to ensure all data is included
@@ -5062,13 +5137,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // 8 so the tail cannot be lumpy and to 1 so it is always legal. At npl 64 that is
         // around 180 items over 10 threads, chunk 4, about 45 fetch_adds per op.
         const int64_t chunk = split_rows
-            ? MAX((int64_t) 1, MIN((int64_t) 8, n_items / (4*(int64_t) nth)))
+            ? MAX((int64_t) 1, MIN((int64_t) 8, n_items / (4*(int64_t) dnth)))
             : 1;
 
         // The first claim is our own thread index, which is why the counter starts at nth:
         // chunks 0 .. nth-1 are spoken for without anybody touching the counter.
-        int64_t claim_lo = split_rows ? (int64_t) ith * chunk : 0;
+        int64_t claim_lo = split_rows ? (int64_t) dith * chunk : 0;
         int64_t claim_hi = claim_lo + chunk;
+
+        // stealing is confined to the domain: this is the only counter this thread touches
+        std::atomic<int64_t> & steal_ctr = steal_ctr_at(dom);
 
         // Is item idx ours? Claim forward until the window covers idx, then answer. A thread's
         // own fetch_add results strictly increase and idx only ever moves forward, so each
@@ -5083,7 +5161,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // So every item is run, by one thread.
         auto own = [&](int64_t idx) -> bool {
             while (idx >= claim_hi) {
-                claim_lo = steal_ctr->fetch_add(1, std::memory_order_relaxed) * chunk;
+                claim_lo = steal_ctr.fetch_add(1, std::memory_order_relaxed) * chunk;
                 claim_hi = claim_lo + chunk;
             }
             return idx >= claim_lo;
@@ -5093,6 +5171,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            // not this domain's expert: its rows are computed by the other domain's threads,
+            // and it contributes no item to this thread's numbering (the n_items loop above
+            // skipped it for the same reason)
+            if (expert_dom(cur_a) != dom) {
+                continue;
+            }
+
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             if (cne1 == 0) {

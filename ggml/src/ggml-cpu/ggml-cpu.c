@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "moe-tail.h"
+#include "expert-tiles.h"
 #include "tq2-kernel.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -3926,6 +3927,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
+    // expert-tiles: pin this thread to the one cpu the placement gave it, so that
+    // "thread ith is in L3 domain d" is a fact about the machine and not a hope about
+    // the scheduler. Idempotent, one syscall per thread per plan. No-op when off.
+    ggml_expert_tiles_apply(state->ith);
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
@@ -4282,6 +4288,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
+
+    // expert-tiles: build the expert placement here, on the main thread, before any worker
+    // touches the graph. It is a pure function of (n_threads, the process affinity mask,
+    // the sysfs cache topology), so the workers read it without synchronising. No-op when off.
+    ggml_expert_tiles_plan(n_threads);
 
     bool disposable_threadpool = false;
 
