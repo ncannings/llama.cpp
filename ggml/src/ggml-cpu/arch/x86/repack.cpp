@@ -17,6 +17,8 @@
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
+#include "../../tq2-kernel.h"
+#include "tq2-vnni.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -6404,4 +6406,229 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 
 #endif
+}
+
+// =====================================================================================
+// TQ2_0, x86, repacked multi-row (block_tq2_0x8 with interleave 4, i.e. the "8x4" traits)
+// =====================================================================================
+//
+// Hypothesis this code tests: the x86 TQ2_0 ceiling is the single-row ggml_vec_dot signature,
+// not the instruction mix. The lab measured the VNNI single-row form at 1.13x the shipped AVX2
+// kernel against a 2.03x arithmetic floor, and recovered 1.17x and 1.32x purely by putting two
+// and four independent rows in flight. A single-row vec_dot has no independent rows to put in
+// flight, so the only way to collect the rest is a layout that hands the kernel several weight
+// rows at once. That is what the repack buffer already does on Arm, and until now x86 selected
+// no TQ2_0 repack variant at all: every x86 ternary matmul, decode and prefill alike, went
+// through the single-row vec_dot.
+//
+// WHY interleave 4 and not 8. In block_tq2_0x8 with blck_size_interleave = 4, chunk k of a
+// block holds source bytes 4k .. 4k+3 of every one of the 8 interleaved rows, laid out as
+// qs[k * 32 + j * 4 + i] for row j and byte i. One 32-byte load is therefore 8 rows x 4
+// consecutive source bytes, and vpdpbusd's int32 lane j is exactly row j's partial sum over
+// those 4 bytes. The activation side needs only the 4 q8 bytes those source bytes multiply,
+// broadcast into all 8 lanes: one dword broadcast feeds 8 weight rows. With interleave 8 the
+// lanes would straddle two source-byte groups of the same row and need a horizontal fold.
+//
+// ADDRESSING, taken from ggml_gemv_tq2_0_NxM_q8_K_generic_impl and held to it by test:
+//   source byte b = 4k + i  ->  q8 index (b / 32) * 128 + (b % 32) + sh * 32
+// and since 4 divides 32, b / 32 = k / 8 and b % 32 = (k % 8) * 4 + i for i = 0..3, so the
+// four bytes are consecutive in q8 and the plane sh only shifts the base by 32.
+//
+// IDENTITY. The integer sum per (row, block) is the same integer as the generic reference
+// computes: the mask leaves plane sh scaled by 4^sh and one arithmetic right shift per plane
+// per block takes it back exactly, the regrouping of the adds is integer associativity, and
+// the bsums total is the same int32 sum subtracted at the same point. The float epilogue is
+// then the generic's, operation for operation and in the same order: one fp16-to-fp32 of the
+// eight column deltas, one multiply by the activation delta, one convert of the int32 sum, one
+// multiply, one add into the per-column accumulator. The bar is equality of the output bytes
+// at every batch size, not a tolerance; tests/test-tq2_0-kernel-switch.cpp is that bar and
+// carries a sabotage arm to prove the comparison could have failed.
+//
+// TO ABLATE: GGML_CPU_TQ2_KERNEL=old routes both functions below to the scalar generic
+// reference; llama.cpp's own --no-repack removes the repacked buffer as well and puts the
+// whole model back on the single-row vec_dot.
+
+#if defined(GGML_TQ2_X86_VNNI)
+
+// four int32 accumulators, one per 2-bit plane, folded back by the exact shifts
+static inline __m256i ggml_tq2_x86_fold(__m256i a0, __m256i a1, __m256i a2, __m256i a3) {
+    return _mm256_add_epi32(_mm256_add_epi32(a0, _mm256_srai_epi32(a1, 2)),
+                            _mm256_add_epi32(_mm256_srai_epi32(a2, 4), _mm256_srai_epi32(a3, 6)));
+}
+
+// the eight column deltas of one repacked block as eight fp32 lanes
+static inline __m256 ggml_tq2_x86_col_d(const ggml_half * d) {
+    return GGML_F32Cx8_LOAD(d);
+}
+
+// GEMV: one activation row, eight weight rows per int32 lane. Two accumulators per plane
+// (even and odd chunks) because one chain of 16 dependent vpdpbusd per plane is latency
+// bound on Zen 4; splitting by chunk parity is integer-associative and changes no sum.
+static void ggml_gemv_tq2_0_8x4_q8_K_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    constexpr int ncols_interleaved = 8;
+    const int     qk                = QK_K;
+    const int     nb                = n / qk;
+
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const __m256i m03 = _mm256_set1_epi8(0x03);
+    const __m256i m0c = _mm256_set1_epi8(0x0c);
+    const __m256i m30 = _mm256_set1_epi8(0x30);
+    const __m256i mc0 = _mm256_set1_epi8((char) 0xc0);
+
+    const block_q8_K * a_ptr = (const block_q8_K *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_tq2_0x8 * b_ptr = (const block_tq2_0x8 *) vx + (x * nb);
+
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int l = 0; l < nb; l++) {
+            int32_t bsum = 0;
+            for (int sb = 0; sb < QK_K / 16; sb++) {
+                bsum += a_ptr[l].bsums[sb];
+            }
+
+            __m256i e0 = _mm256_setzero_si256(), e1 = e0, e2 = e0, e3 = e0;
+            __m256i o0 = e0, o1 = e0, o2 = e0, o3 = e0;
+
+            for (int k = 0; k < (QK_K / 4) / 4; k += 2) {
+                const int8_t * q8 = a_ptr[l].qs + (k >> 3) * 128 + (k & 7) * 4;
+
+                const __m256i we = _mm256_loadu_si256((const __m256i *) (b_ptr[l].qs + (k + 0) * 32));
+                e0 = ggml_tq2_dpbusd(e0, _mm256_and_si256(we, m03), ggml_tq2_bcast32(q8 +   0));
+                e1 = ggml_tq2_dpbusd(e1, _mm256_and_si256(we, m0c), ggml_tq2_bcast32(q8 +  32));
+                e2 = ggml_tq2_dpbusd(e2, _mm256_and_si256(we, m30), ggml_tq2_bcast32(q8 +  64));
+                e3 = ggml_tq2_dpbusd(e3, _mm256_and_si256(we, mc0), ggml_tq2_bcast32(q8 +  96));
+
+                const __m256i wo = _mm256_loadu_si256((const __m256i *) (b_ptr[l].qs + (k + 1) * 32));
+                o0 = ggml_tq2_dpbusd(o0, _mm256_and_si256(wo, m03), ggml_tq2_bcast32(q8 +   4));
+                o1 = ggml_tq2_dpbusd(o1, _mm256_and_si256(wo, m0c), ggml_tq2_bcast32(q8 +  36));
+                o2 = ggml_tq2_dpbusd(o2, _mm256_and_si256(wo, m30), ggml_tq2_bcast32(q8 +  68));
+                o3 = ggml_tq2_dpbusd(o3, _mm256_and_si256(wo, mc0), ggml_tq2_bcast32(q8 + 100));
+            }
+
+            __m256i sumi = ggml_tq2_x86_fold(_mm256_add_epi32(e0, o0), _mm256_add_epi32(e1, o1),
+                                             _mm256_add_epi32(e2, o2), _mm256_add_epi32(e3, o3));
+            sumi = _mm256_sub_epi32(sumi, _mm256_set1_epi32(bsum));
+
+            const __m256 d = _mm256_mul_ps(ggml_tq2_x86_col_d(b_ptr[l].d), _mm256_set1_ps(a_ptr[l].d));
+
+            acc = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), acc);
+        }
+
+        _mm256_storeu_ps(s + x * ncols_interleaved, acc);
+    }
+}
+
+// GEMM: four activation rows of a block_q8_Kx4 panel against the same eight weight rows.
+// MR is how many of the four are kept in flight at once; 4 needs 16 int32 accumulators, which
+// only fits without spilling when AVX512VL gives 32 ymm registers.
+#if defined(__AVX512VL__)
+#define GGML_TQ2_X86_GEMM_MR 4
+#else
+#define GGML_TQ2_X86_GEMM_MR 2
+#endif
+
+static void ggml_gemm_tq2_0_8x4_q8_K_vnni(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    constexpr int ncols_interleaved = 8;
+    constexpr int MR                = GGML_TQ2_X86_GEMM_MR;
+    const int     qk                = QK_K;
+    const int     nb                = n / qk;
+
+    assert(n % qk == 0);
+    assert(nr % 4 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    const __m256i mask[4] = { _mm256_set1_epi8(0x03), _mm256_set1_epi8(0x0c),
+                              _mm256_set1_epi8(0x30), _mm256_set1_epi8((char) 0xc0) };
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb);
+
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_tq2_0x8 * b_ptr = (const block_tq2_0x8 *) vx + (x * nb);
+
+            __m256 acc[4];
+            for (int m = 0; m < 4; m++) {
+                acc[m] = _mm256_setzero_ps();
+            }
+
+            for (int l = 0; l < nb; l++) {
+                // block_q8_Kx4 stores the 16 bsums of row m in groups of four at (g / 4) * 16 + m * 4 + g % 4
+                int32_t bsum[4];
+                for (int m = 0; m < 4; m++) {
+                    int32_t t = 0;
+                    for (int g = 0; g < QK_K / 16; g++) {
+                        t += a_ptr[l].bsums[(g / 4) * 16 + m * 4 + (g % 4)];
+                    }
+                    bsum[m] = t;
+                }
+
+                const __m256 col_d = ggml_tq2_x86_col_d(b_ptr[l].d);
+
+                for (int m0 = 0; m0 < 4; m0 += MR) {
+                    __m256i ac[MR][4];
+                    for (int mm = 0; mm < MR; mm++) {
+                        for (int sh = 0; sh < 4; sh++) {
+                            ac[mm][sh] = _mm256_setzero_si256();
+                        }
+                    }
+
+                    for (int k = 0; k < (QK_K / 4) / 4; k++) {
+                        const __m256i w    = _mm256_loadu_si256((const __m256i *) (b_ptr[l].qs + k * 32));
+                        const int     base = ((k >> 3) * 32 + (k & 7)) * 16;
+
+                        for (int sh = 0; sh < 4; sh++) {
+                            const __m256i  wm = _mm256_and_si256(w, mask[sh]);
+                            const int8_t * q8 = a_ptr[l].qs + base + sh * 128;
+                            for (int mm = 0; mm < MR; mm++) {
+                                ac[mm][sh] = ggml_tq2_dpbusd(ac[mm][sh], wm, ggml_tq2_bcast32(q8 + (m0 + mm) * 4));
+                            }
+                        }
+                    }
+
+                    for (int mm = 0; mm < MR; mm++) {
+                        const int m = m0 + mm;
+
+                        __m256i sumi = ggml_tq2_x86_fold(ac[mm][0], ac[mm][1], ac[mm][2], ac[mm][3]);
+                        sumi = _mm256_sub_epi32(sumi, _mm256_set1_epi32(bsum[m]));
+
+                        const __m256 d = _mm256_mul_ps(col_d, _mm256_set1_ps(a_ptr[l].d[m]));
+
+                        acc[m] = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), acc[m]);
+                    }
+                }
+            }
+
+            for (int m = 0; m < 4; m++) {
+                _mm256_storeu_ps(s + (y * 4 + m) * bs + x * ncols_interleaved, acc[m]);
+            }
+        }
+    }
+}
+#endif // GGML_TQ2_X86_VNNI
+
+void ggml_gemv_tq2_0_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(GGML_TQ2_X86_VNNI)
+    if (ggml_tq2_kernel_new()) {
+        ggml_gemv_tq2_0_8x4_q8_K_vnni(n, s, bs, vx, vy, nr, nc);
+        return;
+    }
+#endif
+    ggml_gemv_tq2_0_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_tq2_0_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(GGML_TQ2_X86_VNNI)
+    if (ggml_tq2_kernel_new()) {
+        ggml_gemm_tq2_0_8x4_q8_K_vnni(n, s, bs, vx, vy, nr, nc);
+        return;
+    }
+#endif
+    ggml_gemm_tq2_0_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 }

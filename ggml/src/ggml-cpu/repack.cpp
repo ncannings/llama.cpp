@@ -19,6 +19,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "arch/x86/tq2-vnni.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -5366,6 +5367,15 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &tq2_0_8x4_q8_K;
             }
         }
+#if defined(GGML_TQ2_X86_VNNI)
+        // x86 VNNI: the same 8-row interleave the Arm dotprod path uses, with the 4-byte
+        // interleave that makes one vpdpbusd lane one weight row. Without VNNI there is no
+        // x86 TQ2_0 repack kernel and the tensor stays on the single-row vec_dot, which is
+        // what every x86 build did before this change.
+        if ((ggml_cpu_has_avx512_vnni() || ggml_cpu_has_avx_vnni()) && cur->ne[1] % 8 == 0) {
+            return &tq2_0_8x4_q8_K;
+        }
+#endif
     } else if (cur->type == GGML_TYPE_IQ4_NL) {
         if (ggml_cpu_has_avx2()) {
             if (cur->ne[1] % 8 == 0) {
