@@ -1,10 +1,26 @@
-// Checks the repacked TQ2_0 GEMV/GEMM path (CPU_REPACK buffer type) against the
-// un-repacked ggml_vec_dot_tq2_0_q8_K path for batch sizes 1, 4 and 17.
+// Two checks on the repacked TQ2_0 GEMV/GEMM path (CPU_REPACK buffer type).
+//
+// 1. AGAINST THE UN-REPACKED ggml_vec_dot_tq2_0_q8_K PATH, at a tolerance. This one cannot be
+//    exact and is not meant to be: the two paths associate the floats differently. vec_dot
+//    keeps an eight-lane float accumulator in which lane k is a partial sum of ONE output
+//    column, converts and scales each lane separately and horizontally sums at the end; the
+//    repacked path has eight output COLUMNS in its eight lanes, so a column's block sum is one
+//    int32 that is converted and scaled once. Same integers, different float tree. The arm
+//    exists to catch a wrong layout or wrong addressing, which shows up as a large difference,
+//    not as a last-bit one.
+//
+// 2. AGAINST THE SCALAR GENERIC REPACK KERNELS, exactly. GGML_CPU_TQ2_KERNEL=old routes the
+//    repacked path to ggml_gemv_tq2_0_8x*_q8_K_generic and ggml_gemm_tq2_0_8x*_q8_K_generic,
+//    which share the float epilogue of the vectorised form operation for operation. That makes
+//    equality of the output BYTES the right bar, and it is the bar the x86 VNNI kernels (and
+//    the Arm ones) are held to here, at every batch size from 1 to 17. A sabotage arm follows
+//    it, because an equality test that cannot fail proves nothing.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-cpu/tq2-kernel.h"
 
 #include <cmath>
 #include <cstdio>
@@ -108,6 +124,10 @@ int main(void) {
     const int64_t batches[]   = { 1, 4, 17 };
     const float   tol_rel     = 1e-3f;
 
+    // shapes for the exact arm: a single block, a long row, one column group with many blocks,
+    // and a column count that is a multiple of the 8-row interleave but not of 16
+    const int64_t xshapes[][2] = { { 256, 8 }, { 1024, 40 }, { 3072, 8 }, { 512, 72 } };
+
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
@@ -151,6 +171,90 @@ int main(void) {
             ok = ok && pass;
         }
     }
+
+    // -------------------------------------------------------------------------------------
+    // exact arm: the vectorised repack kernels against the scalar generic reference, B = 1..17
+    printf("-- exact arm: repacked kernels vs the scalar generic reference (bar: 0 differing bytes)\n");
+    for (const auto & shape : xshapes) {
+        const int64_t K = shape[0];
+        const int64_t N = shape[1];
+
+        std::vector<float> w_f(K * N);
+        for (auto & v : w_f) {
+            v = dist(rng);
+        }
+        std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N);
+        ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N, K, nullptr);
+
+        size_t worst  = 0;
+        float  worstd = 0.0f;
+        for (int64_t B = 1; B <= 17; B++) {
+            std::vector<float> x(K * B);
+            for (auto & v : x) {
+                v = dist(rng);
+            }
+
+            std::vector<float> out_old, out_new;
+            setenv("GGML_CPU_TQ2_KERNEL", "old", 1); ggml_tq2_kernel_init();
+            if (!run_mul_mat(backend, buft_repack, w_q, K, N, x, B, out_old, true)) { return 1; }
+            setenv("GGML_CPU_TQ2_KERNEL", "new", 1); ggml_tq2_kernel_init();
+            if (!run_mul_mat(backend, buft_repack, w_q, K, N, x, B, out_new, true)) { return 1; }
+
+            for (size_t i = 0; i < out_old.size(); i++) {
+                if (memcmp(&out_old[i], &out_new[i], sizeof(float)) != 0) {
+                    worst++;
+                    worstd = std::max(worstd, std::fabs(out_old[i] - out_new[i]));
+                }
+            }
+        }
+        printf("K=%5d N=%4d B=1..17  differing elements=%zu  max diff=%.3e  %s\n",
+               (int) K, (int) N, worst, worstd, worst == 0 ? "OK" : "FAIL");
+        ok = ok && worst == 0;
+    }
+
+    // sabotage: one code byte flipped under the new kernel only, which MUST be visible
+    {
+        const int64_t K = 1024, N = 40, B = 17;
+        std::vector<float> w_f(K * N);
+        for (auto & v : w_f) { v = dist(rng); }
+        std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N);
+        ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N, K, nullptr);
+        std::vector<float> x(K * B);
+        for (auto & v : x) { v = dist(rng); }
+
+        std::vector<float> out_old, out_sab;
+        setenv("GGML_CPU_TQ2_KERNEL", "old", 1); ggml_tq2_kernel_init();
+        if (!run_mul_mat(backend, buft_repack, w_q, K, N, x, B, out_old, true)) { return 1; }
+
+        std::vector<uint8_t> w_sab = w_q;
+        w_sab[9] ^= 0x04;
+        setenv("GGML_CPU_TQ2_KERNEL", "new", 1); ggml_tq2_kernel_init();
+        if (!run_mul_mat(backend, buft_repack, w_sab, K, N, x, B, out_sab, true)) { return 1; }
+
+        size_t ndiff = 0;
+        for (size_t i = 0; i < out_old.size(); i++) {
+            if (memcmp(&out_old[i], &out_sab[i], sizeof(float)) != 0) { ndiff++; }
+        }
+        printf("sabotage (one code byte flipped): differing elements %zu of %zu  %s\n",
+               ndiff, out_old.size(), ndiff > 0 ? "OK (the comparison can fail)" : "FAIL (comparison is vacuous)");
+        ok = ok && ndiff > 0;
+    }
+
+    // the interleave gate: a row count that is not a multiple of 8 must NOT be repacked
+    {
+        ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_TQ2_0, 512, 12);
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft_repack);
+        const bool repacked = buf_w != nullptr && w->extra != nullptr;
+        printf("interleave gate: ne[1]=12 repacked=%d  %s\n", (int) repacked, repacked ? "FAIL" : "OK");
+        ok = ok && !repacked;
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx_w);
+    }
+
+    unsetenv("GGML_CPU_TQ2_KERNEL");
+    ggml_tq2_kernel_init();
 
     ggml_backend_free(backend);
 

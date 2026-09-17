@@ -3,8 +3,14 @@
 // from 1 to 17 (1 takes the GEMV path, 4 and up take the GEMM path, and the odd sizes
 // exercise the gemm2 and single-row tails).
 //
-//   old = shift-and-mask unpack, the kernel that shipped on moe-gemm-v8
-//   new = mask-only unpack with per-scale accumulators, the candidate
+//   old = the kernel that shipped: shift-and-mask unpack on Arm, and on x86 both the shipped
+//         AVX2 vec_dot and the scalar generic reference for the repacked path
+//   new = the candidate: mask-only unpack on Arm, VNNI mask-only on x86
+//
+// Two paths are compared, because on x86 they are two different pieces of work. The repacked
+// path (a CPU_REPACK weight, gemv and gemm) is the first section; the un-repacked single-row
+// ggml_vec_dot_tq2_0_q8_K path (a plain CPU weight) is the second. Each has its own sabotage
+// arm.
 //
 // The bar is exact equality of the output bytes, not a tolerance. The run also asserts that
 // the switch itself is live (ggml_tq2_kernel_new() follows the environment) and ends with a
@@ -55,13 +61,22 @@ static bool tq2_0_is_repacked(ggml_backend_buffer_type_t buft) {
 }
 
 static bool run_mul_mat(ggml_backend_t backend, ggml_backend_buffer_type_t buft, const std::vector<uint8_t> & w_q,
-                        int64_t K, int64_t N, const std::vector<float> & x, int64_t B, std::vector<float> & out) {
+                        int64_t K, int64_t N, const std::vector<float> & x, int64_t B, std::vector<float> & out,
+                        bool require_repack = true) {
     ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
     ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_TQ2_0, K, N);
     ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
-    if (buf_w == nullptr || w->extra == nullptr) {
+    if (buf_w == nullptr) {
+        fprintf(stderr, "weight allocation failed\n");
+        return false;
+    }
+    if (require_repack && w->extra == nullptr) {
         fprintf(stderr, "weight did not get repack traits\n");
+        return false;
+    }
+    if (!require_repack && w->extra != nullptr) {
+        fprintf(stderr, "weight was repacked on the plain CPU buffer type\n");
         return false;
     }
     ggml_backend_tensor_set(w, w_q.data(), 0, w_q.size());
@@ -111,9 +126,10 @@ int main(void) {
     ggml_backend_load_all();
 
     ggml_backend_buffer_type_t buft_repack = find_repack_buft();
-    if (buft_repack == nullptr || !tq2_0_is_repacked(buft_repack)) {
-        printf("test-tq2_0-kernel-switch: SKIP (no TQ2_0 repack variant registered for this CPU)\n");
-        return 0;
+    const bool have_repack = buft_repack != nullptr && tq2_0_is_repacked(buft_repack);
+    if (!have_repack) {
+        printf("no TQ2_0 repack variant registered for this CPU: the repacked section is skipped, "
+               "the vec_dot section still runs\n");
     }
 
     // the switch must actually follow the environment, or everything below compares a
@@ -132,6 +148,8 @@ int main(void) {
         return 1;
     }
 
+    ggml_backend_buffer_type_t buft_plain = ggml_backend_cpu_buffer_type();
+
     ggml_backend_t backend = ggml_backend_cpu_init();
     const int n_threads = 4;
     ggml_backend_cpu_set_n_threads(backend, n_threads);
@@ -144,7 +162,9 @@ int main(void) {
     bool ok = true;
     size_t cases = 0;
 
+    printf("-- repacked gemv/gemm path\n");
     for (const auto & shape : shapes) {
+      if (!have_repack) { break; }
         const int64_t K = shape[0];
         const int64_t N = shape[1];
 
@@ -190,7 +210,7 @@ int main(void) {
     // Sabotage: one code byte of the weight changed under the new kernel only. The same
     // comparison must now report differences; if it does not, the comparison above proved
     // nothing.
-    {
+    if (have_repack) {
         const int64_t K = 2560, N = 128, B = 17;
         std::vector<float> w_f(K * N);
         for (auto & v : w_f) { v = dist(rng); }
@@ -210,6 +230,81 @@ int main(void) {
 
         const size_t ndiff = count_diff(out_old, out_sab);
         printf("sabotage (one code byte flipped): differing elements %zu of %zu  %s\n",
+               ndiff, out_old.size(), ndiff > 0 ? "OK (the comparison can fail)" : "FAIL (comparison is vacuous)");
+        ok = ok && ndiff > 0;
+        cases++;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Second path: the un-repacked single-row ggml_vec_dot_tq2_0_q8_K, reached by allocating
+    // the weight on the plain CPU buffer type. On x86 "old" is the shipped AVX2 shift-and-mask
+    // kernel and "new" is the VNNI mask-only form; the two reach the same eight int32 lanes and
+    // share the epilogue byte for byte, so the bar is again equality, not tolerance.
+    printf("-- un-repacked vec_dot path\n");
+    for (const auto & shape : shapes) {
+        const int64_t K = shape[0];
+        const int64_t N = shape[1];
+
+        std::vector<float> w_f(K * N);
+        for (auto & v : w_f) {
+            v = dist(rng);
+        }
+        std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N);
+        ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N, K, nullptr);
+
+        size_t worst = 0;
+        for (int64_t B = 1; B <= 17; B++) {
+            std::vector<float> x(K * B);
+            for (auto & v : x) {
+                v = dist(rng);
+            }
+
+            std::vector<float> out_old;
+            std::vector<float> out_new;
+
+            select_kernel("old");
+            if (!run_mul_mat(backend, buft_plain, w_q, K, N, x, B, out_old, false)) { return 1; }
+            select_kernel("new");
+            if (!run_mul_mat(backend, buft_plain, w_q, K, N, x, B, out_new, false)) { return 1; }
+
+            const size_t ndiff = count_diff(out_old, out_new);
+            worst = std::max(worst, ndiff);
+            cases++;
+            if (ndiff != 0) {
+                float md = 0.0f;
+                for (size_t i = 0; i < out_old.size(); i++) {
+                    md = std::max(md, std::fabs(out_old[i] - out_new[i]));
+                }
+                printf("K=%5d N=%4d B=%3d  differing elements %zu of %zu  max abs diff %.3e  FAIL\n",
+                       (int) K, (int) N, (int) B, ndiff, out_old.size(), md);
+                ok = false;
+            }
+        }
+        printf("K=%5d N=%4d  B=1..17, %d threads: differing elements %zu  %s\n",
+               (int) K, (int) N, n_threads, worst, worst == 0 ? "OK" : "FAIL");
+    }
+
+    // Sabotage for the vec_dot path, same shape as the arm above.
+    {
+        const int64_t K = 2560, N = 128, B = 17;
+        std::vector<float> w_f(K * N);
+        for (auto & v : w_f) { v = dist(rng); }
+        std::vector<uint8_t> w_q(ggml_row_size(GGML_TYPE_TQ2_0, K) * N);
+        ggml_quantize_chunk(GGML_TYPE_TQ2_0, w_f.data(), w_q.data(), 0, N, K, nullptr);
+        std::vector<float> x(K * B);
+        for (auto & v : x) { v = dist(rng); }
+
+        std::vector<float> out_old, out_sab;
+        select_kernel("old");
+        if (!run_mul_mat(backend, buft_plain, w_q, K, N, x, B, out_old, false)) { return 1; }
+
+        std::vector<uint8_t> w_sab = w_q;
+        w_sab[7] ^= 0x01;
+        select_kernel("new");
+        if (!run_mul_mat(backend, buft_plain, w_sab, K, N, x, B, out_sab, false)) { return 1; }
+
+        const size_t ndiff = count_diff(out_old, out_sab);
+        printf("sabotage, vec_dot path (one code byte flipped): differing elements %zu of %zu  %s\n",
                ndiff, out_old.size(), ndiff > 0 ? "OK (the comparison can fail)" : "FAIL (comparison is vacuous)");
         ok = ok && ndiff > 0;
         cases++;
