@@ -7,6 +7,8 @@
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
+#include "../../tq2-kernel.h"
+#include "tq2-vnni.h"
 
 #include <math.h>
 #include <string.h>
@@ -1505,19 +1507,28 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
-void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
-
-    const block_tq2_0 * GGML_RESTRICT x = vx;
-    const block_q8_K  * GGML_RESTRICT y = vy;
-
-    const int nb = n / QK_K;
+// TQ2_0, x86. Two kernels behind GGML_CPU_TQ2_KERNEL (see ggml/src/ggml-cpu/tq2-kernel.h):
+//
+//   old  the shipped AVX2 shift-and-mask form, moved here verbatim.
+//   new  the VNNI form: all four 2-bit planes selected by a mask alone and accumulated with
+//        vpdpbusd into four int32 accumulators, folded back by three exact arithmetic shifts
+//        per block. The default when the build has VNNI.
+//
+// Identity, not tolerance. vpdpbusd's int32 lane k covers code bytes 4k .. 4k+3, which is
+// exactly the lane mapping the old kernel arrives at after its _mm256_madd_epi16, so the two
+// forms reach the same eight int32 lanes before the epilogue and the epilogue itself is
+// unchanged: one _mm256_cvtepi32_ps, one multiply by d, one add into the same eight-lane
+// sumf, one hsum_float_8. The bsums correction moves from an int16 subtract before the madd
+// to an int32 subtract after it, which is the same integer because the old kernel's int16
+// sums cannot overflow (256 * 127 = 32512) and madd_epi16(a - b, 1) = madd_epi16(a, 1) -
+// madd_epi16(b, 1) over int32.
+//
+// Measured on one Zen 4 core (2026-09-17): 1.13x cache-resident, bit-identical, against an
+// arithmetic floor of 2.03x that the single-row signature cannot reach because it has no
+// independent rows to interleave. That is what the repacked multi-row path is for.
 
 #if defined(__AVX2__)
+static void ggml_vec_dot_tq2_0_q8_K_old(int nb, float * GGML_RESTRICT s, const block_tq2_0 * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y) {
     __m256 sumf = _mm256_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
@@ -1562,7 +1573,69 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_8(sumf);
+}
 
+#if defined(GGML_TQ2_X86_VNNI)
+static void ggml_vec_dot_tq2_0_q8_K_new(int nb, float * GGML_RESTRICT s, const block_tq2_0 * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y) {
+    const __m256i m03 = _mm256_set1_epi8(0x03);
+    const __m256i m0c = _mm256_set1_epi8(0x0c);
+    const __m256i m30 = _mm256_set1_epi8(0x30);
+    const __m256i mc0 = _mm256_set1_epi8((char) 0xc0);
+
+    __m256 sumf = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        __m256i a0 = _mm256_setzero_si256();
+        __m256i a1 = _mm256_setzero_si256();
+        __m256i a2 = _mm256_setzero_si256();
+        __m256i a3 = _mm256_setzero_si256();
+
+        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *) (x[i].qs + j));
+
+            a0 = ggml_tq2_dpbusd(a0, _mm256_and_si256(w, m03), _mm256_loadu_si256((const __m256i *) (y[i].qs + j*4 +  0)));
+            a1 = ggml_tq2_dpbusd(a1, _mm256_and_si256(w, m0c), _mm256_loadu_si256((const __m256i *) (y[i].qs + j*4 + 32)));
+            a2 = ggml_tq2_dpbusd(a2, _mm256_and_si256(w, m30), _mm256_loadu_si256((const __m256i *) (y[i].qs + j*4 + 64)));
+            a3 = ggml_tq2_dpbusd(a3, _mm256_and_si256(w, mc0), _mm256_loadu_si256((const __m256i *) (y[i].qs + j*4 + 96)));
+        }
+
+        // planes 1, 2 and 3 carry a factor of 4, 16 and 64 from the mask; the shifts are exact
+        __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(a0, _mm256_srai_epi32(a1, 2)),
+                                        _mm256_add_epi32(_mm256_srai_epi32(a2, 4), _mm256_srai_epi32(a3, 6)));
+
+        const __m256i ysum = _mm256_loadu_si256((const __m256i *) y[i].bsums);
+        const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
+
+        sumi = _mm256_sub_epi32(sumi, _mm256_madd_epi16(ysum, _mm256_set1_epi16(1)));
+
+        sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi), d), sumf);
+    }
+
+    *s = hsum_float_8(sumf);
+}
+#endif // GGML_TQ2_X86_VNNI
+#endif // __AVX2__
+
+void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__AVX2__)
+#if defined(GGML_TQ2_X86_VNNI)
+    if (ggml_tq2_kernel_new()) {
+        ggml_vec_dot_tq2_0_q8_K_new(nb, s, x, y);
+        return;
+    }
+#endif
+    ggml_vec_dot_tq2_0_q8_K_old(nb, s, x, y);
 #else
     UNUSED(x);
     UNUSED(y);
