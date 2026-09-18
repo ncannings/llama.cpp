@@ -165,7 +165,15 @@ int main(void) {
     }
 
     const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
-    const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 } };
+    // The last two are the REAL expert shapes of the trained tile MoE
+    // (tile-moe-8x2-step18000-TQ2_0.gguf): ffn_gate_exps and ffn_up_exps are ne = (768,
+    // 2048, 8) and ffn_down_exps is (2048, 768, 8). They are carried here so the placement
+    // is checked on the shapes it will actually run, not only on the synthetic ones. n_as
+    // stays 4 rather than the model's 8: n_as changes only how many experts the routing
+    // spreads over, which the four map variants in expert-tiles-identity.sh already vary,
+    // whereas the SHAPE is what selects the kernel, the NB_COLS rounding and the gemv/gemm
+    // dispatch.
+    const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 }, { 768, 2048 }, { 2048, 768 } };
     const int64_t tokens[]    = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 17 };
     std::vector<int> threads = { 1, 4, 10 };
     if (const char * e = getenv("GGML_TEST_THREADS")) {
