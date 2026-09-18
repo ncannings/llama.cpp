@@ -21,6 +21,41 @@
 
 #include "repack.h"
 
+// ---------------- GGML_PROF instrumentation (profiling tree only) ----------------
+#include <ctime>
+extern "C" {
+double ggml_profid_t[64];
+double ggml_profid_quant_t[64];
+double ggml_profid_group_t[64];
+double ggml_profid_bar_t[64];
+double ggml_profid_panel_t[64];
+double ggml_profid_gemm_t[64];
+double ggml_profid_gemv_t[64];
+double ggml_profid_scatter_t[64];
+long   ggml_profid_rows_gemm;
+long   ggml_profid_rows_gemv;
+long   ggml_profid_groups;
+long   ggml_profid_experts;
+long   ggml_profid_ops;
+long   ggml_profid_barriers;
+long   ggml_profid_rem[4];
+double ggml_profrp_t[64];
+double ggml_profrp_quant_t[64];
+double ggml_profrp_bar_t[64];
+long   ggml_profrp_n;
+long   ggml_profrp_barriers;
+extern int ggml_prof_active;
+}
+static inline double ggml_profid_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9*t.tv_nsec;
+}
+struct ggml_profid_scope {
+    double * acc; double t0; 
+    ggml_profid_scope(double * a) : acc(a), t0(ggml_profid_now()) {}
+    ~ggml_profid_scope() { if (acc && ggml_prof_active) *acc += ggml_profid_now() - t0; }
+};
+// ---------------------------------------------------------------------------------
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 #endif
@@ -4604,6 +4639,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const bool    q_par  = ggml_mm_parquant() && nth > 1 && ne12 == 1 && ne11 == 1 &&
                                q_blck > 0 && (ne10 % q_blck) == 0 && (ne10 / q_blck) > 1;
 
+        ggml_profid_scope prof_rp_total(ith < 64 ? &ggml_profrp_t[ith] : nullptr);
+        if (ith == 0 && ggml_prof_active) { ggml_profrp_n++; }
+        const double prof_rp_q0 = ggml_profid_now();
+
         if (q_par) {
             const int64_t nblk = ne10 / q_blck;
             const int64_t b0   = ((int64_t) ith       * nblk) / nth;
@@ -4631,6 +4670,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
         }
         }
+
+        if (ith < 64 && ggml_prof_active) { ggml_profrp_quant_t[ith] += ggml_profid_now() - prof_rp_q0; }
 
         const int64_t nr0_static = ggml_nrows(op->src[0]);
 
@@ -4681,7 +4722,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             src0_end   = (src0_end   % NB_COLS) ? src0_end   + NB_COLS - (src0_end   % NB_COLS) : src0_end;
             src0_end   = MIN(src0_end, ne01);
 
-            ggml_barrier(params->threadpool);
+            { const double prof_b0 = ggml_profid_now();
+              ggml_barrier(params->threadpool);
+              if (ith < 64 && ggml_prof_active) { ggml_profrp_bar_t[ith] += ggml_profid_now() - prof_b0; }
+              if (ith == 0 && ggml_prof_active) { ggml_profrp_barriers++; } }
 
             if (src0_start < src0_end) {
                 forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, 0, ne11);
@@ -4733,7 +4777,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
         }
 
-        ggml_barrier(params->threadpool);
+        { const double prof_b0 = ggml_profid_now();
+          ggml_barrier(params->threadpool);
+          if (ith < 64 && ggml_prof_active) { ggml_profrp_bar_t[ith] += ggml_profid_now() - prof_b0; }
+          if (ith == 0 && ggml_prof_active) { ggml_profrp_barriers++; } }
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
@@ -4839,6 +4886,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int nth = params->nth;
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+
+        ggml_profid_scope prof_id_total(ith < 64 ? &ggml_profid_t[ith] : nullptr);
+        if (ith == 0 && ggml_prof_active) { ggml_profid_ops++; }
 
         // we don't support permuted src0 or src1
         GGML_ASSERT(nb00 == ggml_type_size(src0->type));
@@ -4973,6 +5023,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // given row changes, and the ggml_barrier below orders every write before any read.
         const int64_t nrow1 = ne11*ne12;
 
+        const double prof_id_q0 = ggml_profid_now();
         for (int64_t ir = ith; ir < nrow1; ir += nth) {
             const int64_t i11 = ir % ne11;
             const int64_t i12 = ir / ne11;
@@ -4982,8 +5033,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                        ne10);
         }
 
+        if (ith < 64 && ggml_prof_active) { ggml_profid_quant_t[ith] += ggml_profid_now() - prof_id_q0; }
+
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
 
+        const double prof_id_g0 = ggml_profid_now();
         if (ith == 0) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
@@ -5013,7 +5067,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
         }
 
-        ggml_barrier(params->threadpool);
+        if (ith < 64 && ggml_prof_active) { ggml_profid_group_t[ith] += ggml_profid_now() - prof_id_g0; }
+
+        { const double prof_b0 = ggml_profid_now();
+          ggml_barrier(params->threadpool);
+          if (ith < 64 && ggml_prof_active) { ggml_profid_bar_t[ith] += ggml_profid_now() - prof_b0; }
+          if (ith == 0 && ggml_prof_active) { ggml_profid_barriers++; } }
 
         // ------------------------------------------------------------------- work partition
         //
@@ -5196,6 +5255,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             if (cne1 == 0) {
                 continue;
             }
+            if (ith == 0 && ggml_prof_active) { ggml_profid_experts++; ggml_profid_rem[cne1 & 3]++; }
 
             if (split_rows) {
                 if (claim_lo >= n_items) {
@@ -5230,16 +5290,27 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         rows[ir] = wdata + (rm.i1 % ne11)*nbw1 + (int64_t) rm.i2*nbw2;
                     }
 
+                    const double prof_p0 = ggml_profid_now();
                     interleave_rows(rows, nrows, panel, ne10);
+                    const double prof_p1 = ggml_profid_now();
 
                     gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                         ne00, dst_tile, ncols, src0_cur + src0_cur_start * nb01, panel, 4, ncols);
+                    const double prof_p2 = ggml_profid_now();
 
                     for (int64_t ir = 0; ir < nrows; ++ir) {
                         const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + ir);
                         memcpy((float *) ((char *) dst->data + (rm.i1 * nb1 + (int64_t) rm.i2 * nb2)) + src0_cur_start,
                                dst_tile + ir*ncols,
                                ncols*sizeof(float));
+                    }
+                    const double prof_p3 = ggml_profid_now();
+                    if (ith < 64 && ggml_prof_active) {
+                        ggml_profid_panel_t[ith]   += prof_p1 - prof_p0;
+                        ggml_profid_gemm_t[ith]    += prof_p2 - prof_p1;
+                        ggml_profid_scatter_t[ith] += prof_p3 - prof_p2;
+                        __atomic_fetch_add(&ggml_profid_groups, 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&ggml_profid_rows_gemm, nrows, __ATOMIC_RELAXED);
                     }
                 };
 
@@ -5289,9 +5360,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
 
+                const double prof_v0 = ggml_profid_now();
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, ncols);
+                if (ith < 64 && ggml_prof_active) { ggml_profid_gemv_t[ith] += ggml_profid_now() - prof_v0; }
+                if (ggml_prof_active) { __atomic_fetch_add(&ggml_profid_rows_gemv, 1, __ATOMIC_RELAXED); }
             }
         }
 #undef MMID_MATRIX_ROW

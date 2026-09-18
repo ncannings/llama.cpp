@@ -586,6 +586,16 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+#include <time.h>
+double ggml_profq_t; long ggml_profq_n; long ggml_profq_elem; double ggml_profmb_t[64]; double ggml_profmt_t[80]; long ggml_profmt_n[80]; double ggml_profmt_w[80];
+double ggml_profmi_t[80]; long ggml_profmi_n[80]; double ggml_profmi_w[80];
+int ggml_prof_active = 1; static int ggml_prof_want_ntok = -2; long ggml_prof_ntok_seen;
+extern double ggml_profid_t[64], ggml_profid_quant_t[64], ggml_profid_group_t[64], ggml_profid_bar_t[64], ggml_profid_panel_t[64], ggml_profid_gemm_t[64], ggml_profid_gemv_t[64], ggml_profid_scatter_t[64];
+extern long ggml_profid_rows_gemm, ggml_profid_rows_gemv, ggml_profid_groups, ggml_profid_experts, ggml_profid_ops, ggml_profid_barriers;
+extern long ggml_profid_rem[4];
+extern double ggml_profrp_t[64], ggml_profrp_quant_t[64], ggml_profrp_bar_t[64];
+extern long ggml_profrp_n, ggml_profrp_barriers;
+static double ggml_profq_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -1352,6 +1362,7 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
+    const double profq_t0 = (ith == 0) ? ggml_profq_now() : 0.0;
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1390,11 +1401,14 @@ UseGgmlGemm1:;
     }
 
     if (ith == 0) {
+        if (ggml_prof_active) { ggml_profq_t += ggml_profq_now() - profq_t0; ggml_profq_n++; if (src1->type != vec_dot_type) ggml_profq_elem += ne10*ne11*ne12*ne13; }
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
         ggml_threadpool_chunk_set(params->threadpool, params->wslot, nth);
     }
 
+    { const double mb0 = ggml_profq_now();
     ggml_barrier(params->threadpool);
+    if (ith < 64 && ggml_prof_active) ggml_profmb_t[ith] += ggml_profq_now() - mb0; }
 
     // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
     // of src1 from the work buffer
@@ -2766,8 +2780,10 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+void ggml_prof_dump(void);
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
+    ggml_prof_dump();
 
     const int n_threads = threadpool->n_threads;
 
@@ -3920,6 +3936,26 @@ static inline void ggml_psched_wait(struct ggml_threadpool * tp, int w, int nth)
     }
 }
 
+#include <time.h>
+static double ggml_prof_t[GGML_OP_COUNT]; static long ggml_prof_n[GGML_OP_COUNT]; static double ggml_prof_bar; static long ggml_prof_graphs; static double ggml_prof_thr[64]; static double ggml_prof_thr_mm[64]; static double ggml_prof_thr_bar[64];
+static double ggml_prof_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
+void ggml_prof_dump(void){ double tot=0; for(int i=0;i<GGML_OP_COUNT;i++) tot+=ggml_prof_t[i]; if(ggml_prof_graphs==0) return;
+  { long nn=0; for(int i=0;i<GGML_OP_COUNT;i++) nn+=ggml_prof_n[i];
+    fprintf(stderr,"GGML_PROF graphs=%ld ntok_filter=%d nodes_per_graph=%.1f total_op_ms_per_graph=%.3f barrier_ms_per_graph=%.3f\n", ggml_prof_graphs, ggml_prof_want_ntok, (double)nn/ggml_prof_graphs, 1e3*tot/ggml_prof_graphs, 1e3*ggml_prof_bar/ggml_prof_graphs); }
+  for(int i=0;i<GGML_OP_COUNT;i++) if(ggml_prof_n[i]) fprintf(stderr,"GGML_PROF %-16s n/graph=%6.1f ms/graph=%8.4f\n", ggml_op_name(i), (double)ggml_prof_n[i]/ggml_prof_graphs, 1e3*ggml_prof_t[i]/ggml_prof_graphs);
+  fprintf(stderr,"GGML_PROF QUANT_SRC1      n/graph=%6.1f ms/graph=%8.4f elem/graph=%8.0f \n", (double)ggml_profq_n/ggml_prof_graphs, 1e3*ggml_profq_t/ggml_prof_graphs, (double)ggml_profq_elem/ggml_prof_graphs);
+  for(int i=0;i<80;i++) if(ggml_profmt_n[i]) fprintf(stderr,"GGML_PROF MUL_MAT[%-8s] n/graph=%6.1f ms/graph=%8.4f Mweights/graph=%8.2f\n", ggml_type_name((enum ggml_type)i), (double)ggml_profmt_n[i]/ggml_prof_graphs, 1e3*ggml_profmt_t[i]/ggml_prof_graphs, 1e-6*ggml_profmt_w[i]/ggml_prof_graphs);
+  for(int i=0;i<80;i++) if(ggml_profmi_n[i]) fprintf(stderr,"GGML_PROF MUL_MAT_ID[%-8s] n/graph=%6.1f ms/graph=%8.4f Mweights/graph=%8.2f\n", ggml_type_name((enum ggml_type)i), (double)ggml_profmi_n[i]/ggml_prof_graphs, 1e3*ggml_profmi_t[i]/ggml_prof_graphs, 1e-6*ggml_profmi_w[i]/ggml_prof_graphs);
+  { int nthr=0; for(int t=0;t<64;t++) if(ggml_prof_thr[t]>0) nthr++; if(nthr<1) nthr=1;
+    double id_t=0,id_q=0,id_g=0,id_b=0,id_p=0,id_gm=0,id_gv=0,id_s=0,rp_t=0,rp_q=0,rp_b=0;
+    for(int t=0;t<nthr;t++){ id_t+=ggml_profid_t[t]; id_q+=ggml_profid_quant_t[t]; id_g+=ggml_profid_group_t[t]; id_b+=ggml_profid_bar_t[t]; id_p+=ggml_profid_panel_t[t]; id_gm+=ggml_profid_gemm_t[t]; id_gv+=ggml_profid_gemv_t[t]; id_s+=ggml_profid_scatter_t[t]; rp_t+=ggml_profrp_t[t]; rp_q+=ggml_profrp_quant_t[t]; rp_b+=ggml_profrp_bar_t[t]; }
+    double G=(double)ggml_prof_graphs, N=(double)nthr;
+    fprintf(stderr,"GGML_PROF MMID_REMAINDER per_graph r0=%.1f r1=%.1f r2=%.1f r3=%.1f\n", ggml_profid_rem[0]/G, ggml_profid_rem[1]/G, ggml_profid_rem[2]/G, ggml_profid_rem[3]/G);
+    fprintf(stderr,"GGML_PROF MMID ops/graph=%.1f experts/graph=%.1f groups/graph=%.1f rows_gemm/graph=%.1f rows_gemv/graph=%.1f barriers/graph=%.1f nthr=%d\n", ggml_profid_ops/G, ggml_profid_experts/G, ggml_profid_groups/G, (double)ggml_profid_rows_gemm/G, (double)ggml_profid_rows_gemv/G, ggml_profid_barriers/G, nthr);
+    fprintf(stderr,"GGML_PROF MMID_MS_PER_GRAPH_MEANTHREAD total=%.4f quant_src1=%.4f rowgroup=%.4f barrier=%.4f panel=%.4f gemm=%.4f gemv=%.4f scatter=%.4f other=%.4f\n", 1e3*id_t/G/N, 1e3*id_q/G/N, 1e3*id_g/G/N, 1e3*id_b/G/N, 1e3*id_p/G/N, 1e3*id_gm/G/N, 1e3*id_gv/G/N, 1e3*id_s/G/N, 1e3*(id_t-id_q-id_g-id_b-id_p-id_gm-id_gv-id_s)/G/N);
+    fprintf(stderr,"GGML_PROF MMID_MS_PER_GRAPH_THREAD0 total=%.4f quant_src1=%.4f rowgroup=%.4f barrier=%.4f panel=%.4f gemm=%.4f gemv=%.4f scatter=%.4f other=%.4f\n", 1e3*ggml_profid_t[0]/G, 1e3*ggml_profid_quant_t[0]/G, 1e3*ggml_profid_group_t[0]/G, 1e3*ggml_profid_bar_t[0]/G, 1e3*ggml_profid_panel_t[0]/G, 1e3*ggml_profid_gemm_t[0]/G, 1e3*ggml_profid_gemv_t[0]/G, 1e3*ggml_profid_scatter_t[0]/G, 1e3*(ggml_profid_t[0]-ggml_profid_quant_t[0]-ggml_profid_group_t[0]-ggml_profid_bar_t[0]-ggml_profid_panel_t[0]-ggml_profid_gemm_t[0]-ggml_profid_gemv_t[0]-ggml_profid_scatter_t[0])/G);
+    fprintf(stderr,"GGML_PROF REPACK_MULMAT n/graph=%.1f barriers/graph=%.1f ms/graph_meanthread total=%.4f quant_src1=%.4f barrier=%.4f | thread0 total=%.4f quant_src1=%.4f barrier=%.4f\n", ggml_profrp_n/G, ggml_profrp_barriers/G, 1e3*rp_t/G/N, 1e3*rp_q/G/N, 1e3*rp_b/G/N, 1e3*ggml_profrp_t[0]/G, 1e3*ggml_profrp_quant_t[0]/G, 1e3*ggml_profrp_bar_t[0]/G); }
+  for(int t=0;t<64;t++) if(ggml_prof_thr[t]>0) fprintf(stderr,"GGML_PROF thread %2d compute_ms_per_graph=%7.3f mul_mat_ms_per_graph=%7.3f barrier_ms_per_graph=%7.3f mmbarrier_ms_per_graph=%7.3f\n", t, 1e3*ggml_prof_thr[t]/ggml_prof_graphs, 1e3*ggml_prof_thr_mm[t]/ggml_prof_graphs, 1e3*(t==0?ggml_prof_bar:ggml_prof_thr_bar[t])/ggml_prof_graphs, 1e3*ggml_profmb_t[t]/ggml_prof_graphs); }
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -4010,7 +4046,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
             }
             GGML_ASSERT(st.gnode[psched_slot] == node_n);
+            { const double wt0 = ggml_prof_now();
             ggml_psched_wait(tp, st.wait[psched_slot], params.nth);
+            if (ggml_prof_active) { const double wdt = ggml_prof_now() - wt0;
+                if (state->ith == 0) ggml_prof_bar += wdt; else if (state->ith < 64) ggml_prof_thr_bar[state->ith] += wdt; } }
         }
 
         if (wslots > 1) {
@@ -4022,12 +4061,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int tail_node_n0 = node_n;
+        const double prof_t0 = ggml_prof_now();
+        const enum ggml_op prof_op = node->op;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
         }
+        { const double dt = ggml_prof_now() - prof_t0; if (ggml_prof_active) {
+          if (state->ith < 64) { ggml_prof_thr[state->ith] += dt; if (prof_op == GGML_OP_MUL_MAT) ggml_prof_thr_mm[state->ith] += dt; }
+          if (state->ith == 0) { ggml_prof_t[prof_op] += dt; ggml_prof_n[prof_op]++;
+            if (prof_op == GGML_OP_MUL_MAT && node->src[0] && (int)node->src[0]->type < 80) { ggml_profmt_t[node->src[0]->type] += dt; ggml_profmt_n[node->src[0]->type]++; ggml_profmt_w[node->src[0]->type] += (double)ggml_nelements(node->src[0]); }
+            if (prof_op == GGML_OP_MUL_MAT_ID && node->src[0] && (int)node->src[0]->type < 80) { ggml_profmi_t[node->src[0]->type] += dt; ggml_profmi_n[node->src[0]->type]++; ggml_profmi_w[node->src[0]->type] += (double)ggml_nelements(node->src[0]); } } } }
 
         if (psched) {
             GGML_ASSERT(st.fuse[psched_slot] == n_fused);
@@ -4044,9 +4090,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes && !(n_fused == 0 && tail_node_n0 + 1 < tail_run_end)) {
+            const double bt0 = ggml_prof_now();
             ggml_barrier(state->threadpool);
+            if (ggml_prof_active) { const double bdt = ggml_prof_now() - bt0;
+                if (state->ith == 0) ggml_prof_bar += bdt; else if (state->ith < 64) ggml_prof_thr_bar[state->ith] += bdt; }
         }
     }
+
+    if (state->ith == 0 && ggml_prof_active) { ggml_prof_graphs++; }
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
@@ -4281,6 +4332,42 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
     ggml_cpu_extra_cache_init();
+
+    // GGML_PROF: restrict all accounting to graphs whose token count equals $GGML_PROF_NTOK.
+    // n_tokens is read off the first MUL_MAT node's src1 second dimension.
+    if (ggml_prof_want_ntok == -2) {
+        const char * e = getenv("GGML_PROF_NTOK");
+        ggml_prof_want_ntok = e ? atoi(e) : -1;
+    }
+    if (ggml_prof_want_ntok < 0) {
+        ggml_prof_active = 1;
+    } else {
+        int ntok = -1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
+                ntok = (int) cgraph->nodes[i]->src[1]->ne[1];
+                break;
+            }
+        }
+        ggml_prof_ntok_seen = ntok;
+        ggml_prof_active = (ntok == ggml_prof_want_ntok);
+    }
+
+    // GGML_PROF: one-shot structural dump of the matmul nodes and their src1 identity.
+    { static int dumped = 0;
+      if (!dumped && ggml_prof_active && getenv("GGML_PROF_GRAPH")) {
+        dumped = 1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (nd->op != GGML_OP_MUL_MAT && nd->op != GGML_OP_MUL_MAT_ID) continue;
+            fprintf(stderr, "GGML_PROF_NODE %4d %-11s src0=%-7s ne00=%5d ne01=%6d src1=%p data=%p ne10=%5d ne11=%5d ne12=%5d name=%s\n",
+                i, ggml_op_name(nd->op), ggml_type_name(nd->src[0]->type),
+                (int) nd->src[0]->ne[0], (int) nd->src[0]->ne[1],
+                (const void *) nd->src[1], (const void *) nd->src[1]->data,
+                (int) nd->src[1]->ne[0], (int) nd->src[1]->ne[1], (int) nd->src[1]->ne[2],
+                nd->src[1]->name);
+        }
+      } }
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
