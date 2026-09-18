@@ -173,7 +173,11 @@ int main(void) {
     // spreads over, which the four map variants in expert-tiles-identity.sh already vary,
     // whereas the SHAPE is what selects the kernel, the NB_COLS rounding and the gemv/gemm
     // dispatch.
-    const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 }, { 768, 2048 }, { 2048, 768 } };
+    // ... and the last two are the two-expert model's shapes (intermediate 1024):
+    // ffn_gate_exps/ffn_up_exps ne = (768, 1024, 2), ffn_down_exps ne = (1024, 768, 2).
+    const int64_t shapes[][2] = { { 256, 8 }, { 512, 24 }, { 2048, 512 },
+                                  { 768, 2048 }, { 2048, 768 },
+                                  { 768, 1024 }, { 1024, 768 } };
     const int64_t tokens[]    = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 17 };
     std::vector<int> threads = { 1, 4, 10 };
     if (const char * e = getenv("GGML_TEST_THREADS")) {
