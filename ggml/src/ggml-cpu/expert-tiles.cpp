@@ -6,6 +6,10 @@
 
 #include "ggml-impl.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,14 +20,13 @@
 #    include <sched.h>
 #endif
 
-namespace {
 
 // ------------------------------------------------------------------ cached environment
 
-int   g_mode     = -1;   // -1 unread, 0 off, 1 pin and place, 2 pin only
-int   g_verbose  = -1;
+static int   g_mode     = -1;   // -1 unread, 0 off, 1 pin and place, 2 pin only
+static int   g_verbose  = -1;
 
-const char * sysfs_root() {
+static const char * sysfs_root() {
     const char * e = getenv("GGML_CPU_SYSFS_ROOT");
     return (e && *e) ? e : "/sys/devices/system/cpu";
 }
@@ -34,7 +37,8 @@ const char * sysfs_root() {
 // built once on the main thread and then read-only, so the workers need no synchronisation
 // beyond the kickoff they already have.
 
-struct plan {
+struct ggml_expert_tiles_ctx {
+    std::vector<int> cpus;
     int planned_for = -1;                 // n_threads this plan was built for, -1 = none
 
     int n_domains = 0;
@@ -45,7 +49,13 @@ struct plan {
     long domain_l3   [GGML_EXPERT_TILES_MAX_DOMAINS];  // bytes, for the record only
 };
 
-plan g_plan;
+namespace {
+
+std::once_flag env_once;
+#if defined(__linux__)
+thread_local cpu_set_t saved_affinity;
+thread_local bool affinity_saved = false;
+#endif
 
 // map: a per-expert domain list, applied modulo its length. Empty means "block".
 std::vector<int> g_map;
@@ -72,46 +82,41 @@ bool read_file(const std::string & path, std::string & out) {
 // "0-4,7,9-10" -> the set of cpus, as a sorted vector
 std::vector<int> parse_cpu_list(const std::string & s) {
     std::vector<int> out;
-    size_t i = 0;
-    while (i < s.size()) {
-        while (i < s.size() && (s[i] == ',' || s[i] == ' ')) {
-            i++;
-        }
-        if (i >= s.size()) {
-            break;
-        }
+    const char * p = s.c_str();
+    while (*p) {
+        if (*p < '0' || *p > '9') { return {}; }
         char * end = nullptr;
-        long a = strtol(s.c_str() + i, &end, 10);
-        if (end == s.c_str() + i) {
-            break;
+        errno = 0;
+        long a = strtol(p, &end, 10), b = a;
+        if (errno || a > INT_MAX) { return {}; }
+        p = end;
+        if (*p == '-') {
+            ++p;
+            if (*p < '0' || *p > '9') { return {}; }
+            errno = 0;
+            b = strtol(p, &end, 10);
+            if (errno || b > INT_MAX || b < a) { return {}; }
+            p = end;
         }
-        i = (size_t) (end - s.c_str());
-        long b = a;
-        if (i < s.size() && s[i] == '-') {
-            i++;
-            b = strtol(s.c_str() + i, &end, 10);
-            i = (size_t) (end - s.c_str());
-        }
-        for (long c = a; c <= b; c++) {
-            out.push_back((int) c);
-        }
+        if (b - a > GGML_MAX_N_THREADS || out.size() + (size_t) (b - a + 1) > GGML_MAX_N_THREADS) { return {}; }
+        for (long c = a; c <= b; ++c) { out.push_back((int) c); }
+        if (!*p) { break; }
+        if (*p++ != ',' || !*p) { return {}; }
     }
     return out;
 }
 
 // "8192K", "16384K", "2M" -> bytes. 0 if unreadable.
 long parse_size(const std::string & s) {
+    if (s.empty() || s[0] < '0' || s[0] > '9') { return 0; }
     char * end = nullptr;
-    long v = strtol(s.c_str(), &end, 10);
-    if (end == s.c_str()) {
-        return 0;
-    }
-    if (*end == 'K' || *end == 'k') {
-        v *= 1024;
-    } else if (*end == 'M' || *end == 'm') {
-        v *= 1024 * 1024;
-    }
-    return v;
+    errno = 0;
+    long v = strtol(s.c_str(), &end, 10), factor = 1;
+    if (errno || v <= 0) { return 0; }
+    if (*end == 'K' || *end == 'k') { factor = 1024; ++end; }
+    else if (*end == 'M' || *end == 'm') { factor = 1024*1024; ++end; }
+    if (*end || v > LONG_MAX/factor) { return 0; }
+    return v*factor;
 }
 
 // The last-level (highest level) unified cache shared by this cpu. Returns false if the
@@ -125,20 +130,26 @@ bool cpu_llc(int cpu, std::vector<int> & shared, long & size_bytes) {
         if (!read_file(d + "/level", lvl)) {
             continue;
         }
-        if (read_file(d + "/type", type) && type != "Unified" && type != "Data") {
+        if (!read_file(d + "/type", type) || (type != "Unified" && type != "Data")) {
             continue;
         }
-        const int level = atoi(lvl.c_str());
-        if (level <= best_level) {
+        const long level = lvl.find_first_not_of("0123456789") == std::string::npos ? parse_size(lvl) : 0;
+        if (level < 2 || level > INT_MAX || level <= best_level) {
             continue;
         }
         if (!read_file(d + "/shared_cpu_list", list)) {
             continue;
         }
-        read_file(d + "/size", sz);
-        best_level  = level;
-        shared      = parse_cpu_list(list);
-        size_bytes  = parse_size(sz);
+        if (!read_file(d + "/size", sz)) { continue; }
+        const long bytes = parse_size(sz);
+        auto cpus = parse_cpu_list(list);
+        if (bytes <= 0 || cpus.empty()) { continue; }
+        std::sort(cpus.begin(), cpus.end());
+        if (std::adjacent_find(cpus.begin(), cpus.end()) != cpus.end() ||
+            !std::binary_search(cpus.begin(), cpus.end(), cpu)) { continue; }
+        best_level  = (int) level;
+        shared      = cpus;
+        size_bytes  = bytes;
     }
     return best_level > 0 && !shared.empty();
 }
@@ -165,67 +176,63 @@ void parse_map(void) {
 // ------------------------------------------------------------------------- public API
 
 static void read_mode(void) {
+    std::call_once(env_once, [] {
     const char * e = getenv("GGML_CPU_EXPERT_TILES");
     const int v = e ? atoi(e) : 0;
     g_mode = (v == 1 || v == 2) ? v : 0;
     const char * vb = getenv("GGML_CPU_EXPERT_TILES_VERBOSE");
     g_verbose = (vb != NULL && atoi(vb) == 1) ? 1 : 0;
+    if (g_mode) { parse_map(); }
+    });
 }
 
 bool ggml_expert_tiles_enabled(void) {
-    if (g_mode < 0) { read_mode(); }
+    read_mode();
     return g_mode != 0;
 }
 
 bool ggml_expert_tiles_placed(void) {
-    if (g_mode < 0) { read_mode(); }
+    read_mode();
     return g_mode == 1;
 }
 
-void ggml_expert_tiles_plan(int n_threads) {
-    if (!ggml_expert_tiles_enabled()) {
-        return;
+struct ggml_expert_tiles_ctx * ggml_expert_tiles_new(const bool * mask) {
+    if (!ggml_expert_tiles_enabled()) { return nullptr; }
+#if !defined(__linux__)
+    GGML_UNUSED(mask);
+    GGML_ABORT("expert-tiles: placement requires Linux affinity");
+#else
+    auto * ctx = new ggml_expert_tiles_ctx{};
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        GGML_ABORT("expert-tiles: sched_getaffinity failed");
     }
-    if (g_plan.planned_for == n_threads) {
-        return;
+    bool explicit_mask = false;
+    for (int c = 0; c < GGML_MAX_N_THREADS; ++c) { explicit_mask |= mask[c]; }
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &allowed) && (!explicit_mask || (c < GGML_MAX_N_THREADS && mask[c]))) {
+            ctx->cpus.push_back(c);
+        }
     }
+    if (ctx->cpus.empty()) { GGML_ABORT("expert-tiles: the pool affinity mask is empty"); }
+    return ctx;
+#endif
+}
+
+void ggml_expert_tiles_free(struct ggml_expert_tiles_ctx * ctx) { delete ctx; }
+
+void ggml_expert_tiles_plan(struct ggml_expert_tiles_ctx * ctx, int n_threads) {
+    if (!ctx) { return; }
+    auto & g_plan = *ctx;
+    const auto & cpus = ctx->cpus;
+    if (g_plan.planned_for == n_threads) { return; }
     if (n_threads < 1 || n_threads > GGML_MAX_N_THREADS) {
         GGML_ABORT("expert-tiles: n_threads %d out of range", n_threads);
     }
-
-#if !defined(__linux__)
-    GGML_ABORT("expert-tiles: the placement needs sched_getaffinity, which this platform has not");
-#else
-    // 1. the cpus this process may run on, CAPTURED ONCE.
-    //
-    // It has to be once, and this is not a subtlety: applying the plan narrows the calling
-    // thread's own affinity to a single cpu, so a second sched_getaffinity from a thread
-    // that has already been pinned returns that one cpu and not the pool. A replan (llama.cpp
-    // uses one thread count for decode and another for batch, so replans are normal) would
-    // then see a one-cpu machine and refuse. The mask is therefore read on the first plan
-    // and reused, which also makes the plan a pure function of how the process was launched.
-    static std::vector<int> cpus;
-    if (cpus.empty()) {
-        cpu_set_t allowed;
-        CPU_ZERO(&allowed);
-        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-            GGML_ABORT("expert-tiles: sched_getaffinity failed");
-        }
-        for (int c = 0; c < CPU_SETSIZE; c++) {
-            if (CPU_ISSET(c, &allowed)) {
-                cpus.push_back(c);
-            }
-        }
-        if (cpus.empty()) {
-            GGML_ABORT("expert-tiles: the process affinity mask is empty");
-        }
-    }
     if ((int) cpus.size() < n_threads) {
-        GGML_ABORT("expert-tiles: %d threads but only %zu cpus in the affinity mask. "
-                   "The placement pins one thread per cpu; give the process at least as many cpus as threads.",
-                   n_threads, cpus.size());
+        GGML_ABORT("expert-tiles: %d threads but only %zu cpus in the affinity mask", n_threads, cpus.size());
     }
-
     // 2. group them by last-level cache. Domains are numbered by their lowest cpu, so the
     //    numbering is a property of the machine and not of the iteration order.
     std::vector<std::vector<int>> dom_cpus;
@@ -305,12 +312,15 @@ void ggml_expert_tiles_plan(int n_threads) {
         g_plan.domain_l3[d] = dom_size[d];
     }
 
+    if (g_map_mode == 2 && n_threads > 1) {
+        for (int d : g_map) {
+            if (d < 0 || d >= ndom) { GGML_ABORT("expert-tiles: map domain %d outside %d domains", d, ndom); }
+        }
+    }
+
     g_plan.n_domains  = ndom;
     g_plan.planned_for = n_threads;
 
-    if (g_map_mode < 0) {
-        parse_map();
-    }
 
     if (g_verbose == 1) {
         fprintf(stderr, "expert-tiles: mode %d (%s), %d threads over %d domains\n", g_mode,
@@ -326,76 +336,85 @@ void ggml_expert_tiles_plan(int n_threads) {
             fprintf(stderr, "\n");
         }
     }
-#endif
 }
 
-void ggml_expert_tiles_apply(int ith) {
-    if (!ggml_expert_tiles_enabled()) {
-        return;
-    }
+void ggml_expert_tiles_apply(const struct ggml_expert_tiles_ctx * ctx, int ith) {
+    if (!ctx) { return; }
+    const auto & g_plan = *ctx;
 #if defined(__linux__)
     if (g_plan.planned_for < 0) {
         GGML_ABORT("expert-tiles: thread %d reached apply with no plan", ith);
     }
-    if (ith >= g_plan.planned_for) {
+    if (ith < 0 || ith >= g_plan.planned_for) {
         GGML_ABORT("expert-tiles: thread %d is outside the plan for %d threads. The pool grew after "
                    "the plan was built; the placement will not run unpinned.", ith, g_plan.planned_for);
     }
-    // once per thread per plan: the pin does not change while the plan does not
-    static thread_local int applied_plan = -1;
-    static thread_local int applied_ith  = -1;
-    if (applied_plan == g_plan.planned_for && applied_ith == ith) {
-        return;
+    if (affinity_saved || sched_getaffinity(0, sizeof(saved_affinity), &saved_affinity) != 0) {
+        GGML_ABORT("expert-tiles: could not save worker affinity");
     }
+    affinity_saved = true;
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(g_plan.thread_cpu[ith], &set);
     if (sched_setaffinity(0, sizeof(set), &set) != 0) {
         GGML_ABORT("expert-tiles: could not pin thread %d to cpu %d", ith, g_plan.thread_cpu[ith]);
     }
-    applied_plan = g_plan.planned_for;
-    applied_ith  = ith;
+
 #else
     GGML_UNUSED(ith);
 #endif
 }
 
-int ggml_expert_tiles_planned_for(void) {
+void ggml_expert_tiles_restore(void) {
+#if defined(__linux__)
+    if (affinity_saved) {
+        if (sched_setaffinity(0, sizeof(saved_affinity), &saved_affinity) != 0) {
+            GGML_ABORT("expert-tiles: could not restore worker affinity");
+        }
+        affinity_saved = false;
+    }
+#endif
+}
+
+int ggml_expert_tiles_planned_for(const struct ggml_expert_tiles_ctx * ctx) {
+    const auto & g_plan = *ctx;
     return g_plan.planned_for;
 }
 
-int ggml_expert_tiles_n_domains(void) {
+int ggml_expert_tiles_n_domains(const struct ggml_expert_tiles_ctx * ctx) {
+    const auto & g_plan = *ctx;
     return g_plan.n_domains;
 }
 
-int ggml_expert_tiles_thread_domain(int ith) {
+int ggml_expert_tiles_thread_domain(const struct ggml_expert_tiles_ctx * ctx, int ith) {
+    const auto & g_plan = *ctx;
     if (ith < 0 || ith >= g_plan.planned_for) {
         GGML_ABORT("expert-tiles: thread %d outside the plan for %d", ith, g_plan.planned_for);
     }
     return g_plan.thread_domain[ith];
 }
 
-int ggml_expert_tiles_domain_nth(int dom) {
+int ggml_expert_tiles_domain_nth(const struct ggml_expert_tiles_ctx * ctx, int dom) {
+    const auto & g_plan = *ctx;
     if (dom < 0 || dom >= g_plan.n_domains) {
         GGML_ABORT("expert-tiles: domain %d outside 0..%d", dom, g_plan.n_domains - 1);
     }
     return g_plan.domain_nth[dom];
 }
 
-int ggml_expert_tiles_domain_rank(int ith) {
+int ggml_expert_tiles_domain_rank(const struct ggml_expert_tiles_ctx * ctx, int ith) {
+    const auto & g_plan = *ctx;
     if (ith < 0 || ith >= g_plan.planned_for) {
         GGML_ABORT("expert-tiles: thread %d outside the plan for %d", ith, g_plan.planned_for);
     }
     return g_plan.thread_rank[ith];
 }
 
-int ggml_expert_tiles_expert_domain(int expert, int n_expert) {
+int ggml_expert_tiles_expert_domain(const struct ggml_expert_tiles_ctx * ctx, int expert, int n_expert) {
+    const auto & g_plan = *ctx;
     const int ndom = g_plan.n_domains;
     if (ndom <= 1) {
         return 0;
-    }
-    if (g_map_mode < 0) {
-        parse_map();
     }
     switch (g_map_mode) {
         case 1:  // cyclic

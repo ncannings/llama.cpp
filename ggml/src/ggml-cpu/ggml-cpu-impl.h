@@ -34,6 +34,7 @@ struct ggml_compute_params {
 
     // mm-invoke: the graph's whole MUL_MAT and MUL_MAT_ID weight working set, from the cplan.
     size_t mm_weight_bytes;
+    const struct ggml_expert_tiles_ctx * expert_tiles;
 };
 
 

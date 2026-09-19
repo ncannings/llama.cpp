@@ -487,6 +487,7 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+    struct ggml_expert_tiles_ctx * expert_tiles;
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
@@ -2793,6 +2794,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 #endif // GGML_USE_OPENMP
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
+    ggml_expert_tiles_free(threadpool->expert_tiles);
     ggml_aligned_free(threadpool->workers, workers_size);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
@@ -3929,8 +3931,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     // expert-tiles: pin this thread to the one cpu the placement gave it, so that
     // "thread ith is in L3 domain d" is a fact about the machine and not a hope about
-    // the scheduler. Idempotent, one syscall per thread per plan. No-op when off.
-    ggml_expert_tiles_apply(state->ith);
+    // the scheduler. Save affinity on entry and restore it on graph completion. No-op when off.
+    ggml_expert_tiles_apply(tp->expert_tiles, state->ith);
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
@@ -3947,6 +3949,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
         /*.wslot      =*/ 0,
         /*.mm_weight_bytes =*/ cplan->mm_weight_bytes,
+        /*.expert_tiles =*/ tp->expert_tiles,
     };
 
     // mm-invoke: work-buffer regions. A node's region is a pure function of its index, so
@@ -4054,6 +4057,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    ggml_expert_tiles_restore();
     ggml_barrier(state->threadpool);
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
@@ -4134,7 +4138,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
     ggml_thread_apply_priority(threadpool->prio);
-    if (ggml_thread_cpumask_is_valid(state->cpumask)) {
+    if (!ggml_expert_tiles_enabled() && ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
 
@@ -4186,7 +4190,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
        ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+       if (!ggml_expert_tiles_enabled() && ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
        }
 
@@ -4209,6 +4213,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
     {
+        threadpool->expert_tiles     = ggml_expert_tiles_new(tpp->cpumask);
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->n_graph          = 0;
@@ -4265,7 +4270,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
         ggml_thread_apply_priority(threadpool->prio);
-        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+        if (!ggml_expert_tiles_enabled() && ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
@@ -4292,7 +4297,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // expert-tiles: build the expert placement here, on the main thread, before any worker
     // touches the graph. It is a pure function of (n_threads, the process affinity mask,
     // the sysfs cache topology), so the workers read it without synchronising. No-op when off.
-    ggml_expert_tiles_plan(n_threads);
+    if (ggml_expert_tiles_enabled() && ggml_is_numa()) {
+        GGML_ABORT("expert-tiles: NUMA affinity is incompatible with expert placement");
+    }
 
     bool disposable_threadpool = false;
 
@@ -4312,6 +4319,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    ggml_expert_tiles_plan(threadpool->expert_tiles, n_threads);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -4327,7 +4336,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+            if (!ggml_expert_tiles_enabled() && ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);

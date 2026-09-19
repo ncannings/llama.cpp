@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -91,7 +92,7 @@ static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t bu
                            const std::vector<uint8_t> & w_q, int64_t K, int64_t N, int64_t n_as,
                            const std::vector<float> & x, int64_t n_used, int64_t n_tok,
                            const std::vector<int32_t> & ids_v, std::vector<float> & out,
-                           bool require_repack) {
+                           bool require_repack, bool broadcast = false) {
     ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
     ggml_tensor * w = ggml_new_tensor_3d(ctx_w, wtype, K, N, n_as);
@@ -110,7 +111,7 @@ static bool run_mul_mat_id(ggml_backend_t backend, ggml_backend_buffer_type_t bu
 
     ggml_init_params cp = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(cp);
-    ggml_tensor * xt  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_used, n_tok);
+    ggml_tensor * xt  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, broadcast ? 1 : n_used, n_tok);
     ggml_tensor * idt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
     ggml_tensor * y   = ggml_mul_mat_id(ctx, w, xt, idt);
     ggml_cgraph * gf  = ggml_new_graph(ctx);
@@ -149,19 +150,37 @@ static std::string fnv1a(const std::vector<float> & v) {
     return std::string(buf);
 }
 
+static bool compare_outputs(const std::vector<float> & ref, const std::vector<float> & got,
+                            ggml_type type, float & max_abs, float & max_diff) {
+    max_abs = max_diff = 0.0f;
+    if (ref.size() != got.size()) { return false; }
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) { return false; }
+        max_abs = std::max(max_abs, std::fabs(ref[i]));
+        max_diff = std::max(max_diff, std::fabs(ref[i] - got[i]));
+    }
+    if (type == GGML_TYPE_TQ2_0) {
+        return memcmp(ref.data(), got.data(), ref.size()*sizeof(float)) == 0;
+    }
+    return std::isfinite(max_diff) && max_diff <= 1e-3f*max_abs;
+}
+
 int main(void) {
+    float self_abs, self_diff;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    if (compare_outputs({1.0f}, {nan}, GGML_TYPE_TQ2_0, self_abs, self_diff) ||
+        compare_outputs({nan}, {1.0f}, GGML_TYPE_TQ2_0, self_abs, self_diff) ||
+        compare_outputs({0.0f}, {-0.0f}, GGML_TYPE_TQ2_0, self_abs, self_diff)) {
+        fprintf(stderr, "output comparator accepted non-finite or different bytes\n");
+        return 1;
+    }
     ggml_backend_load_all();
 
     ggml_backend_buffer_type_t buft_ref    = ggml_backend_cpu_buffer_type();
     ggml_backend_buffer_type_t buft_repack = find_repack_buft();
     if (buft_repack == nullptr) {
         fprintf(stderr, "CPU_REPACK buffer type not available in this build, nothing to test\n");
-        return 0;
-    }
-
-    if (!type_is_repacked(buft_repack, GGML_TYPE_TQ2_0)) {
-        printf("test-repack-mul-mat-id: SKIP (no TQ2_0 repack variant registered for this CPU, needs NEON dotprod or i8mm)\n");
-        return 0;
+        return getenv("GGML_TEST_REQUIRE_TQ2") ? 1 : 0;
     }
 
     const ggml_type wtypes[]  = { GGML_TYPE_TQ2_0, GGML_TYPE_Q4_0 };
@@ -201,6 +220,7 @@ int main(void) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     bool ok = true;
+    size_t tq_cases = 0;
 
     for (const ggml_type wtype : wtypes) {
       if (!type_is_repacked(buft_repack, wtype)) {
@@ -241,14 +261,10 @@ int main(void) {
                     return 1;
                 }
 
-                float max_abs = 0.0f;
-                float max_diff = 0.0f;
-                for (size_t i = 0; i < out_ref.size(); i++) {
-                    max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
-                    max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
-                }
-                const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
-                const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                float max_abs, max_diff;
+                if (getenv("GGML_TEST_POISON_OUTPUT")) { out_rep[0] = nan; }
+                const bool pass = compare_outputs(out_ref, out_rep, wtype, max_abs, max_diff);
+                if (wtype == GGML_TYPE_TQ2_0) { ++tq_cases; }
                 printf("%-6s t=%d K=%5d N=%4d  one expert, rows=%3d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
                        ggml_type_name(wtype), nth, (int) K, (int) N, (int) n_tok, max_abs, max_diff, pass ? "OK" : "FAIL",
                        want_hash ? "  fnv " : "", want_hash ? fnv1a(out_rep).c_str() : "");
@@ -283,14 +299,10 @@ int main(void) {
                     return 1;
                 }
 
-                float max_abs = 0.0f;
-                float max_diff = 0.0f;
-                for (size_t i = 0; i < out_ref.size(); i++) {
-                    max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
-                    max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
-                }
-                const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
-                const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                float max_abs, max_diff;
+                if (getenv("GGML_TEST_POISON_OUTPUT")) { out_rep[0] = nan; }
+                const bool pass = compare_outputs(out_ref, out_rep, wtype, max_abs, max_diff);
+                if (wtype == GGML_TYPE_TQ2_0) { ++tq_cases; }
                 printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
                        ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
                        max_abs, max_diff, pass ? "OK" : "FAIL",
@@ -327,14 +339,10 @@ int main(void) {
                         return 1;
                     }
 
-                    float max_abs = 0.0f;
-                    float max_diff = 0.0f;
-                    for (size_t i = 0; i < out_ref.size(); i++) {
-                        max_abs  = std::max(max_abs, std::fabs(out_ref[i]));
-                        max_diff = std::max(max_diff, std::fabs(out_ref[i] - out_rep[i]));
-                    }
-                    const float tol  = (wtype == GGML_TYPE_TQ2_0) ? 0.0f : 1e-3f*max_abs;
-                    const bool  pass = std::isfinite(max_diff) && max_diff <= tol;
+                    float max_abs, max_diff;
+                    if (getenv("GGML_TEST_POISON_OUTPUT")) { out_rep[0] = nan; }
+                    const bool pass = compare_outputs(out_ref, out_rep, wtype, max_abs, max_diff);
+                    if (wtype == GGML_TYPE_TQ2_0) { ++tq_cases; }
                     printf("%-6s t=%d K=%5d N=%4d  mixed, rows=%d/%d/%d/%d  max|ref|=%10.4f  max diff=%.3e  %s%s%s\n",
                            ggml_type_name(wtype), nth, (int) K, (int) N, counts[0], counts[1], counts[2], counts[3],
                            max_abs, max_diff, pass ? "OK" : "FAIL",
@@ -344,10 +352,46 @@ int main(void) {
             }
         }
 
+        // Cover real expert counts, top-3 dispatch and broadcast gate/up inputs.
+        for (int experts : {2, 8, 256}) {
+            const int used = experts == 2 ? 1 : 3;
+            const int64_t K = 256, N = 24;
+            std::vector<float> weights(K*N*experts);
+            for (auto & v : weights) { v = dist(rng); }
+            std::vector<uint8_t> quantised(ggml_row_size(wtype, K)*N*experts);
+            ggml_quantize_chunk(wtype, weights.data(), quantised.data(), 0, N*experts, K, nullptr);
+            for (int tokens : {1, 3, 5, 17}) {
+                for (bool broadcast : {false, true}) {
+                    std::vector<float> x(K*(broadcast ? 1 : used)*tokens);
+                    for (auto & v : x) { v = dist(rng); }
+                    std::vector<int32_t> ids(used*tokens);
+                    for (int t = 0; t < tokens; ++t) {
+                        for (int u = 0; u < used; ++u) { ids[t*used + u] = (3*t + u) % experts; }
+                    }
+                    std::vector<float> ref, got;
+                    if (!run_mul_mat_id(backend, buft_ref, wtype, quantised, K, N, experts, x, used, tokens, ids, ref, false, broadcast) ||
+                        !run_mul_mat_id(backend, buft_repack, wtype, quantised, K, N, experts, x, used, tokens, ids, got, true, broadcast)) {
+                        return 1;
+                    }
+                    float max_abs, max_diff;
+                    if (getenv("GGML_TEST_POISON_OUTPUT")) { got[0] = nan; }
+                    const bool pass = compare_outputs(ref, got, wtype, max_abs, max_diff);
+                    if (wtype == GGML_TYPE_TQ2_0) { ++tq_cases; }
+                    printf("%-6s t=%d experts=%d used=%d tokens=%d broadcast=%d max diff=%.3e %s%s%s\n",
+                           ggml_type_name(wtype), nth, experts, used, tokens, broadcast, max_diff, pass ? "OK" : "FAIL",
+                           want_hash ? "  fnv " : "", want_hash ? fnv1a(got).c_str() : "");
+                    ok = ok && pass;
+                }
+            }
+        }
+
         ggml_backend_free(backend);
       }
     }
 
+    const size_t expected = threads.size()*(7*(12 + 1 + 4) + 3*4*2);
+    printf("TQ2_0 cases=%zu expected=%zu\n", tq_cases, expected);
+    if (getenv("GGML_TEST_REQUIRE_TQ2") && tq_cases != expected) { ok = false; }
     printf("%s\n", ok ? "test-repack-mul-mat-id: PASS" : "test-repack-mul-mat-id: FAIL");
     return ok ? 0 : 1;
 }

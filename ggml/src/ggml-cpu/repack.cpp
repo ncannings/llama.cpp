@@ -4887,19 +4887,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // counter is primed for ranks that do not exist, so their chunks are never claimed and
         // their experts are never computed. That would be a wrong answer, not a slow one, so
         // it refuses. This cannot be checked at plan time because the shortfall happens after.
-        if (tiles && nth != ggml_expert_tiles_planned_for()) {
+        if (tiles && nth != ggml_expert_tiles_planned_for(params->expert_tiles)) {
             GGML_ABORT("expert-tiles: pool is %d threads but the plan was built for %d. "
-                       "Expert work would be lost; refusing.", nth, ggml_expert_tiles_planned_for());
+                       "Expert work would be lost; refusing.", nth, ggml_expert_tiles_planned_for(params->expert_tiles));
         }
-        const int  ndom  = tiles ? ggml_expert_tiles_n_domains()        : 1;
-        const int  dom   = tiles ? ggml_expert_tiles_thread_domain(ith) : 0;
-        const int  dnth  = tiles ? ggml_expert_tiles_domain_nth(dom)    : nth;
-        const int  dith  = tiles ? ggml_expert_tiles_domain_rank(ith)   : ith;
+        const int  ndom  = tiles ? ggml_expert_tiles_n_domains(params->expert_tiles)        : 1;
+        const int  dom   = tiles ? ggml_expert_tiles_thread_domain(params->expert_tiles, ith) : 0;
+        const int  dnth  = tiles ? ggml_expert_tiles_domain_nth(params->expert_tiles, dom)    : nth;
+        const int  dith  = tiles ? ggml_expert_tiles_domain_rank(params->expert_tiles, ith)   : ith;
 
         // Which domain owns expert a. A pure function of the map, identical on every thread,
         // which is what makes the item list below identical on every thread of a domain.
-        auto expert_dom = [ndom, n_as](int a) -> int {
-            return ndom > 1 ? ggml_expert_tiles_expert_domain(a, n_as) : 0;
+        auto expert_dom = [ndom, n_as, params](int a) -> int {
+            return ndom > 1 ? ggml_expert_tiles_expert_domain(params->expert_tiles, a, n_as) : 0;
         };
 
         // ASSERT the placement, do not infer it from a timing. Under
@@ -5008,7 +5008,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // One counter per domain: chunks 0 .. dnth-1 of domain d are pre-assigned to
             // that domain's threads by rank, exactly as chunks 0 .. nth-1 were pool-wide.
             for (int d = 0; d < ndom; ++d) {
-                steal_ctr_at(d).store(tiles ? ggml_expert_tiles_domain_nth(d) : nth,
+                steal_ctr_at(d).store(tiles ? ggml_expert_tiles_domain_nth(params->expert_tiles, d) : nth,
                                       std::memory_order_relaxed);
             }
         }

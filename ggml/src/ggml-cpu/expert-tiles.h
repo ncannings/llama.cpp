@@ -64,25 +64,21 @@ bool ggml_expert_tiles_enabled(void);
 // Is the EXPERT PARTITION on (mode 1 only)? Mode 2 pins without partitioning.
 bool ggml_expert_tiles_placed(void);
 
-// Build the placement for a pool of n_threads. MAIN THREAD ONLY, before the workers
-// start on a graph. Idempotent: replanning for the same n_threads is a no-op. Aborts
-// rather than falling back.
-void ggml_expert_tiles_plan(int n_threads);
+struct ggml_expert_tiles_ctx;
+struct ggml_expert_tiles_ctx * ggml_expert_tiles_new(const bool * mask);
+void ggml_expert_tiles_free(struct ggml_expert_tiles_ctx * ctx);
 
-// Apply thread ith's pin. Called by each worker, after the plan. Cheap and idempotent.
-void ggml_expert_tiles_apply(int ith);
+// Plan before graph kickoff; each pool owns its CPU mask and placement.
+void ggml_expert_tiles_plan(struct ggml_expert_tiles_ctx * ctx, int n_threads);
+void ggml_expert_tiles_apply(const struct ggml_expert_tiles_ctx * ctx, int ith);
+void ggml_expert_tiles_restore(void);
 
-// The thread count the current plan was built for. A caller whose pool differs from this
-// is looking at a plan that does not describe it, and must refuse rather than use it.
-int ggml_expert_tiles_planned_for(void);
-
-int ggml_expert_tiles_n_domains(void);      // number of L3 domains in the pool
-int ggml_expert_tiles_thread_domain(int ith);  // domain of thread ith
-int ggml_expert_tiles_domain_nth(int dom);     // threads in that domain
-int ggml_expert_tiles_domain_rank(int ith);    // rank of ith among its domain's threads
-
-// Which domain owns expert index `expert` of `n_expert`. Pure function of the map.
-int ggml_expert_tiles_expert_domain(int expert, int n_expert);
+int ggml_expert_tiles_planned_for(const struct ggml_expert_tiles_ctx * ctx);
+int ggml_expert_tiles_n_domains(const struct ggml_expert_tiles_ctx * ctx);
+int ggml_expert_tiles_thread_domain(const struct ggml_expert_tiles_ctx * ctx, int ith);
+int ggml_expert_tiles_domain_nth(const struct ggml_expert_tiles_ctx * ctx, int dom);
+int ggml_expert_tiles_domain_rank(const struct ggml_expert_tiles_ctx * ctx, int ith);
+int ggml_expert_tiles_expert_domain(const struct ggml_expert_tiles_ctx * ctx, int expert, int n_expert);
 
 #ifdef __cplusplus
 }
