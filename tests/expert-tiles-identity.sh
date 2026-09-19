@@ -100,7 +100,7 @@ if env GGML_CPU_EXPERT_TILES=0 GGML_TEST_THREADS=1 GGML_TEST_REQUIRE_TQ2=1 GGML_
     taskset -c 0-4 "$BIN/test-repack-mul-mat-id" > "$OUT/poison.txt" 2>&1; then
     echo "NaN sabotage was accepted"; fail=1
 fi
-grep -q 'TQ2_0.*FAIL' "$OUT/poison.txt" || { echo "NaN sabotage did not reach TQ2_0"; fail=1; }
+grep -qi 'tq2_0.*FAIL' "$OUT/poison.txt" || { echo "NaN sabotage did not reach TQ2_0"; fail=1; }
 
 echo "== EXPERT-TILES KERNEL IDENTITY: $([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $fail
