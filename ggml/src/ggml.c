@@ -909,6 +909,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_TKV1] = {
+        .type_name                = "tkv1",
+        .blck_size                = QK_TKV,
+        .type_size                = sizeof(block_tkv1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tkv1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tkv1_ref,
+    },
+    [GGML_TYPE_TKV3] = {
+        .type_name                = "tkv3",
+        .blck_size                = QK_TKV,
+        .type_size                = sizeof(block_tkv3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tkv3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tkv3_ref,
+    },
     [GGML_TYPE_TQ1_0] = {
         .type_name                = "tq1_0",
         .blck_size                = QK_K,

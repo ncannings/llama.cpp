@@ -113,3 +113,13 @@ GGML_API void iq3xs_free_impl(int grid_size);
 #ifdef __cplusplus
 }
 #endif
+
+// native packed KV formats (branch native-packed-kv)
+GGML_API void quantize_row_tkv1_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_tkv3_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tkv1(const block_tkv1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tkv3(const block_tkv3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_tkv1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+GGML_API size_t quantize_tkv3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+GGML_API void ggml_vec_dot_tkv1_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+GGML_API void ggml_vec_dot_tkv3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

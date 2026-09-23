@@ -311,6 +311,14 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    // native-packed-KV gate (branch native-packed-kv): the existing ternary
+    // types are usable as cache formats where the row length is a multiple of
+    // QK_K. TQ1_0 packs five balanced trits per byte, TQ2_0 two bits per trit.
+    // native packed KV formats: balanced-ternary planes, 64-element block, so
+    // the block divides a 64-wide head. TQ1_0/TQ2_0 cannot serve here because
+    // their QK_K=256 block does not divide n_embd_head_k.
+    GGML_TYPE_TKV1,
+    GGML_TYPE_TKV3,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

@@ -430,7 +430,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // native packed KV formats (branch native-packed-kv): balanced ternary
+        // planes with a 64-element block, so the block divides a 64-wide head.
+        GGML_TYPE_TKV1    = 43, // 1 plane  (one trit with scale)
+        GGML_TYPE_TKV3    = 44, // 3 planes (MST-3)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]

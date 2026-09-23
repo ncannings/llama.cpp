@@ -253,6 +253,22 @@ typedef struct {
     ggml_half d;       // delta
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
+
+// Native packed KV formats. A block is one 64-wide head row. Balanced trits are
+// packed five per byte (3^5 = 243 <= 256); 64 trits therefore take 13 bytes per
+// plane. TKV1 is a single plane, TKV3 is three planes with digit p carrying
+// weight 3^p, which is lossless for integers in [-13, 13].
+#define QK_TKV 64
+#define TKV_PLANE_BYTES 13
+typedef struct {
+    ggml_half d;                          // scale
+    uint8_t   qs[TKV_PLANE_BYTES];        // 1 plane
+} block_tkv1;
+
+typedef struct {
+    ggml_half d;                          // scale
+    uint8_t   qs[3 * TKV_PLANE_BYTES];    // 3 planes, plane-major
+} block_tkv3;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
 #define QK8_1 32
