@@ -201,6 +201,30 @@ int main() {
         check(ok, "ring-buffer slots are byte-identical to an isolated packing");
     }
 
+    // 6. the pad byte is never read: corrupting it must not change any decoded
+    //    value. This is what decides whether zeroing it changed earlier results.
+    {
+        std::vector<float> x(64);
+        for (auto & v : x) {
+            v = nd(rng);
+        }
+        std::vector<uint8_t> blk(42);
+        trc->from_float(x.data(), blk.data(), 64);
+        std::vector<float> clean(64), dirty(64);
+        tr->to_float(blk.data(), clean.data(), 64);
+        blk[41] = 0xFF;                       // corrupt only the pad byte
+        tr->to_float(blk.data(), dirty.data(), 64);
+        float dot_clean = 0.0f, dot_dirty = 0.0f;
+        std::vector<float> y(64, 1.0f);
+        blk[41] = 0x00;
+        trc->vec_dot(64, &dot_clean, 0, blk.data(), 0, y.data(), 0, 1);
+        blk[41] = 0xFF;
+        trc->vec_dot(64, &dot_dirty, 0, blk.data(), 0, y.data(), 0, 1);
+        check(memcmp(clean.data(), dirty.data(), 64 * sizeof(float)) == 0 &&
+              dot_clean == dot_dirty,
+              "the pad byte is never read: corrupting it changes no decoded value");
+    }
+
     printf("\n%s\n", failures == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;
 }
