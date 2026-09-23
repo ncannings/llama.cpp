@@ -115,6 +115,11 @@ static void tkv_quantize(const float * x, void * vy, int64_t k, int planes) {
             q[i] = v;
         }
         uint8_t * blk = y + (size_t) b * bs;
+        // Zero the whole block first: the struct is padded (41 payload bytes in
+        // a 42-byte block for tkv3), and an unwritten pad byte would keep
+        // whatever the buffer held, so identical input could produce different
+        // bytes. Cache contents must be byte-reproducible.
+        memset(blk, 0, bs);
         ggml_half dh = GGML_FP32_TO_FP16(d);
         memcpy(blk, &dh, sizeof(ggml_half));
         tkv_int_to_planes(q, planes, blk + sizeof(ggml_half));
